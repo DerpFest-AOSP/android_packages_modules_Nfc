@@ -76,7 +76,7 @@
 
     <protected-broadcast android:name="android.nfc.intent.action.WATCHDOG" />
     <application android:name=".NfcApplication"
-                 android:icon="@mipmap/ic_launcher"
+                 android:icon="@drawable/icon"
                  android:label="@string/app_name"
                  android:theme="@android:style/Theme.Material.Light"
                  android:persistent="true"
