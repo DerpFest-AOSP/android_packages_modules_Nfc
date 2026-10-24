@@ -555,3 +555,58 @@ TEST_F(NfcNcifTest, ProcDataExistingFragmentEnoughSpaceSuccess) {
   free(p_last_msg);
   free(p_new_msg);
 }
+
+TEST_F(NfcNcifTest, GetConfigLengthExcludesStatusByte) {
+  alignas(NFC_HDR) uint8_t storage[sizeof(NFC_HDR) + 11] = {};
+  NFC_HDR* header = reinterpret_cast<NFC_HDR*>(storage);
+  header->len = 11;
+  const uint8_t packet[] = {0x40, 0x03, 0x08, 0x00, 0x01, 0x33, 0x04, 1, 2, 3, 4};
+  memcpy(header + 1, packet, sizeof(packet));
+  static bool received;
+  received = false;
+  nfc_cb.p_resp_cback = [](tNFC_RESPONSE_EVT event, tNFC_RESPONSE* response) {
+    received = true;
+    EXPECT_EQ(event, NFC_GET_CONFIG_REVT);
+    EXPECT_EQ(response->get_config.status, NFC_STATUS_OK);
+    EXPECT_EQ(response->get_config.tlv_size, 7);
+    EXPECT_EQ(response->get_config.p_param_tlvs[0], 1);
+    EXPECT_EQ(response->get_config.p_param_tlvs[6], 4);
+  };
+  nfc_ncif_proc_get_config_rsp(header);
+  EXPECT_TRUE(received);
+  nfc_cb.p_resp_cback = nullptr;
+}
+
+TEST_F(NfcNcifTest, GetConfigAcceptsZeroLengthRandomUid) {
+  alignas(NFC_HDR) uint8_t storage[sizeof(NFC_HDR) + 7] = {};
+  NFC_HDR* header = reinterpret_cast<NFC_HDR*>(storage);
+  header->len = 7;
+  const uint8_t packet[] = {0x40, 0x03, 0x04, 0x00, 0x01, 0x33, 0x00};
+  memcpy(header + 1, packet, sizeof(packet));
+  static bool received;
+  received = false;
+  nfc_cb.p_resp_cback = [](tNFC_RESPONSE_EVT, tNFC_RESPONSE* response) {
+    received = true;
+    EXPECT_EQ(response->get_config.tlv_size, 3);
+    EXPECT_EQ(response->get_config.p_param_tlvs[2], 0);
+  };
+  nfc_ncif_proc_get_config_rsp(header);
+  EXPECT_TRUE(received);
+  nfc_cb.p_resp_cback = nullptr;
+}
+
+TEST_F(NfcNcifTest, GetConfigRejectsMissingStatusWithoutReadingPayload) {
+  alignas(NFC_HDR) uint8_t storage[sizeof(NFC_HDR) + 3] = {};
+  NFC_HDR* header = reinterpret_cast<NFC_HDR*>(storage);
+  header->len = 3;
+  static bool received;
+  received = false;
+  nfc_cb.p_resp_cback = [](tNFC_RESPONSE_EVT, tNFC_RESPONSE* response) {
+    received = true;
+    EXPECT_EQ(response->get_config.status, NFC_STATUS_FAILED);
+    EXPECT_EQ(response->get_config.tlv_size, 0);
+  };
+  nfc_ncif_proc_get_config_rsp(header);
+  EXPECT_TRUE(received);
+  nfc_cb.p_resp_cback = nullptr;
+}

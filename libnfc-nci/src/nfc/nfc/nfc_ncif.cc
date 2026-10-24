@@ -1647,14 +1647,20 @@ void nfc_ncif_proc_init_rsp(NFC_HDR* p_msg) {
 void nfc_ncif_proc_get_config_rsp(NFC_HDR* p_evt) {
   uint8_t* p;
   tNFC_RESPONSE_CBACK* p_cback = nfc_cb.p_resp_cback;
-  tNFC_RESPONSE evt_data;
+  tNFC_RESPONSE evt_data{};
+
+  if (p_evt->len < NCI_MSG_HDR_SIZE + 1) {
+    evt_data.get_config.status = NFC_STATUS_FAILED;
+    if (p_cback) (*p_cback)(NFC_GET_CONFIG_REVT, &evt_data);
+    return;
+  }
 
   p_evt->offset += NCI_MSG_HDR_SIZE;
   p_evt->len -= NCI_MSG_HDR_SIZE;
   if (p_cback) {
     p = (uint8_t*)(p_evt + 1) + p_evt->offset;
     evt_data.get_config.status = *p++;
-    evt_data.get_config.tlv_size = p_evt->len;
+    evt_data.get_config.tlv_size = p_evt->len - 1;  // Exclude the status byte.
     evt_data.get_config.p_param_tlvs = p;
     (*p_cback)(NFC_GET_CONFIG_REVT, &evt_data);
   }
