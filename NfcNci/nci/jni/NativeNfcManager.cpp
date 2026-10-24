@@ -24,6 +24,8 @@
 #include <nativehelper/ScopedUtfChars.h>
 #include <semaphore.h>
 
+#include <atomic>
+
 #include "HciEventManager.h"
 #include "JavaClassConstants.h"
 #include "NativeWlcManager.h"
@@ -146,6 +148,9 @@ static SyncEvent sNfaEnableDisablePollingEvent;  // event for
                                                  // NFA_EnablePolling(),
                                                  // NFA_DisablePolling()
 SyncEvent gNfaSetConfigEvent;                    // event for Set_Config....
+static tNFA_STATUS sNciSetConfigStatus = NFA_STATUS_FAILED;
+static std::atomic_bool sNciConfigTimedOut{false};
+static tNFA_STATUS sRfDiscoveryStatus = NFA_STATUS_FAILED;
 SyncEvent gNfaGetConfigEvent;                    // event for Get_Config....
 SyncEvent gNfaVsCommand;                         // event for VS commands
 SyncEvent gSendRawVsCmdEvent;  // event for NFA_SendRawVsCommand()
@@ -154,7 +159,7 @@ static bool sIsEpDetectStarted = false;
 static bool sIsNfaEnabled = false;
 static bool sPollingEnabled = false;    // is polling for tag?
 bool sIsDisabling = false;
-static bool sRfEnabled = false;   // whether RF discovery is enabled
+static std::atomic_bool sRfEnabled{false};  // whether RF discovery is enabled
 static bool sSeRfActive = false;  // whether RF with SE is likely active
 static bool sReaderModeEnabled = false;  // whether we're only reading tags, not allowing card emu
 static bool sAbortConnlessWait = false;
@@ -367,6 +372,7 @@ static void nfaConnectionCallback(uint8_t connEvent,
           eventData->status);
       {
         SyncEventGuard guard(sNfaEnableDisablePollingEvent);
+        sRfDiscoveryStatus = eventData->status;
         sNfaEnableDisablePollingEvent.notifyOne();
       }
       struct nfc_jni_native_data* nat = getNative(NULL, NULL);
@@ -394,6 +400,7 @@ static void nfaConnectionCallback(uint8_t connEvent,
       gActivated = false;
       {
         SyncEventGuard guard(sNfaEnableDisablePollingEvent);
+        sRfDiscoveryStatus = eventData->status;
         sNfaEnableDisablePollingEvent.notifyOne();
       }
       struct nfc_jni_native_data* nat = getNative(NULL, NULL);
@@ -914,6 +921,8 @@ void nfaDeviceManagementCallback(uint8_t dmEvent,
       LOG(DEBUG) << StringPrintf("%s: NFA_DM_ENABLE_EVT; status=0x%X", __func__,
                                  eventData->status);
       sIsNfaEnabled = eventData->status == NFA_STATUS_OK;
+      sNciConfigTimedOut = false;
+      NFA_SetCustomConfig(false);
       sIsDisabling = false;
       sNfaEnableEvent.notifyOne();
     } break;
@@ -931,6 +940,7 @@ void nfaDeviceManagementCallback(uint8_t dmEvent,
       LOG(DEBUG) << StringPrintf("%s: NFA_DM_SET_CONFIG_EVT", __func__);
       {
         SyncEventGuard guard(gNfaSetConfigEvent);
+        sNciSetConfigStatus = eventData->set_config.status;
         gNfaSetConfigEvent.notifyOne();
       }
       break;
@@ -2945,6 +2955,10 @@ static void sendRawVsCmdCallback(uint8_t event, uint16_t param_len,
   gSendRawVsCmdEvent.notifyOne();
 }
 
+static jboolean nfcManager_isNciConfigTimedOut(JNIEnv*, jobject) {
+  return sNciConfigTimedOut.load() ? JNI_TRUE : JNI_FALSE;
+}
+
 /*******************************************************************************
  **
  ** Function:        nfcManager_setNciConfig
@@ -2954,33 +2968,68 @@ static void sendRawVsCmdCallback(uint8_t event, uint16_t param_len,
  **                  param : value of the param
  **                  length : length of the parameter payload
  **
- ** Returns:         void
+ ** Returns:         Whether the controller accepted the configuration.
  **
  *******************************************************************************/
-static void nfcManager_setNciConfig(JNIEnv* e, jobject o, jint param_id,
-                                    jbyteArray param, jint length,
-                                    jboolean custom) {
-  LOG(INFO) << StringPrintf("%s; enter", __func__);
-  tNFA_STATUS nfaStat = NFA_STATUS_FAILED;
-  uint8_t* buf;
-
+static jboolean nfcManager_setNciConfig(JNIEnv* e, jobject, jint param_id,
+                                        jbyteArray param, jint length,
+                                        jboolean custom) {
+  if (!param || length < 0 || length > 252 || param_id < 0 || param_id > 255 ||
+      e->GetArrayLength(param) != length)
+    return JNI_FALSE;
   ScopedByteArrayRO bytes(e, param);
-  buf = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(&bytes[0]));
-
-  NFA_SetCustomConfig(custom);
-
-  {
-    SyncEventGuard guard(gNfaSetConfigEvent);
-    android::gMutexConfig.lock();
-    nfaStat = NFA_SetConfig(param_id, length, buf);
-    if (nfaStat == NFA_STATUS_OK) {
-      gNfaSetConfigEvent.wait();  // wait for NFA_DM_SET_CONFIG_EVT
-    } else {
-      LOG(ERROR) << StringPrintf("%s; NFA_SetConfig() failed; error=0x%X",
-                                 __func__, nfaStat);
-    }
-    android::gMutexConfig.unlock();
+  if (bytes.get() == nullptr && length != 0) return JNI_FALSE;
+  uint8_t empty = 0;
+  uint8_t* buf =
+      length == 0
+          ? &empty
+          : const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(bytes.get()));
+  // Use the same lock order as screen-state and polling configuration.
+  AutoMutex configLock(gMutexConfig);
+  if (!sIsNfaEnabled || sIsDisabling || sIsRecovering || sNciConfigTimedOut) {
+    return JNI_FALSE;
   }
+  SyncEventGuard guard(gNfaSetConfigEvent);
+  sNciSetConfigStatus = NFA_STATUS_FAILED;
+  NFA_SetCustomConfig(custom);
+  if (NFA_SetConfig(param_id, length, buf) != NFA_STATUS_OK) return JNI_FALSE;
+  if (!gNfaSetConfigEvent.wait(2000)) {
+    // A late response must never be attributed to a subsequent transaction.
+    sNciConfigTimedOut = true;
+    return JNI_FALSE;
+  }
+  return sIsNfaEnabled && !sIsDisabling && sNciSetConfigStatus == NFA_STATUS_OK;
+}
+
+static jbyteArray nfcManager_getNciConfig(JNIEnv* e, jobject, jint param_id) {
+  if (param_id < 0 || param_id > 255) return nullptr;
+  AutoMutex configLock(gMutexConfig);
+  if (!sIsNfaEnabled || sIsDisabling || sIsRecovering || sNciConfigTimedOut) {
+    return nullptr;
+  }
+  SyncEventGuard guard(gNfaGetConfigEvent);
+  gCurrentConfigLen = 0;
+  tNFA_PMID id = static_cast<tNFA_PMID>(param_id);
+  if (NFA_GetConfig(1, &id) != NFA_STATUS_OK) return nullptr;
+  if (!gNfaGetConfigEvent.wait(2000)) {
+    sNciConfigTimedOut = true;
+    return nullptr;
+  }
+  if (!sIsNfaEnabled || sIsDisabling || gCurrentConfigLen < 3 ||
+      gConfig[0] != 1 || gConfig[1] != id ||
+      gConfig[2] != gCurrentConfigLen - 3) {
+    return nullptr;
+  }
+  jbyteArray result = e->NewByteArray(gConfig[2]);
+  if (result && gConfig[2]) {
+    e->SetByteArrayRegion(result, 0, gConfig[2],
+                          reinterpret_cast<jbyte*>(gConfig + 3));
+  }
+  return result;
+}
+
+static jboolean nfcManager_isDiscoveryEnabled(JNIEnv*, jobject) {
+  return sIsNfaEnabled && !sIsDisabling && !sIsRecovering && sRfEnabled;
 }
 
 /*******************************************************************************
@@ -3068,6 +3117,7 @@ static JNINativeMethod gMethods[] = {
     {"doStartStopPolling", "(Z)V", (void*)nfcManager_doStartStopPolling},
 
     {"disableDiscovery", "()V", (void*)nfcManager_disableDiscovery},
+    {"isDiscoveryEnabled", "()Z", (void*)nfcManager_isDiscoveryEnabled},
 
     {"doSetTimeout", "(II)Z", (void*)nfcManager_doSetTimeout},
 
@@ -3139,7 +3189,9 @@ static JNINativeMethod gMethods[] = {
     {"setFirmwareExitFrameTable", "([Lcom/android/nfc/ExitFrame;[B)Z",
      (void*)nfcManager_setFirmwareExitFrameTable},
     {"doRestartRfDiscovery", "()V", (void*)nfcManager_restartRfDiscovery},
-    {"setNciConfig", "(I[BIZ)V", (void*)nfcManager_setNciConfig},
+    {"isNciConfigTimedOut", "()Z", (void*)nfcManager_isNciConfigTimedOut},
+    {"setNciConfig", "(I[BIZ)Z", (void*)nfcManager_setNciConfig},
+    {"getNciConfig", "(I)[B", (void*)nfcManager_getNciConfig},
     {"getRfDiscoverConfig", "()[B", (void*)nfcManager_doGetRfDiscoverConfig},
     {"doSetDefaultFrame", "([B)V", (void*)nfcManager_doSetDefaultFrame},
 };
@@ -3176,6 +3228,7 @@ void startRfDiscovery(bool isStart) {
   nativeNfcTag_acquireRfInterfaceMutexLock();
   {
     SyncEventGuard guard(sNfaEnableDisablePollingEvent);
+    sRfDiscoveryStatus = NFA_STATUS_FAILED;
     status = isStart ? NFA_StartRfDiscovery() : NFA_StopRfDiscovery();
     if (!sIsRecovering && status == NFA_STATUS_OK) {
       int16_t max_polling_wait_time = NfcConfig::getUnsigned(
@@ -3188,7 +3241,8 @@ void startRfDiscovery(bool isStart) {
             __func__);
         status = NFA_STATUS_TIMEOUT;
       } else {
-        sRfEnabled = isStart;
+        status = sRfDiscoveryStatus;
+        if (status == NFA_STATUS_OK) sRfEnabled = isStart;
       }
     } else if (!sIsRecovering) {
       LOG(ERROR) << StringPrintf(

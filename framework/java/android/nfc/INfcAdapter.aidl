@@ -139,4 +139,5 @@ interface INfcAdapter
     String getGestureExchangeAid();
     void allowOneTransaction();
     List<RfDiscoverConfig> getRfDiscoverConfigurations();
+    Bundle getNfcATagEmulationState();
 }

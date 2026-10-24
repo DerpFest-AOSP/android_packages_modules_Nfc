@@ -254,6 +254,25 @@ public final class NfcServiceTest {
         when(mNfcInjector.getMainLooper()).thenReturn(mLooper.getLooper());
         when(mNfcInjector.getNfcEventLog()).thenReturn(mNfcEventLog);
         when(mNfcInjector.makeDeviceHost(any())).thenReturn(mDeviceHost);
+        when(mNfcInjector.makeNfcATagRecoveryJournal())
+                .thenAnswer(
+                        invocation ->
+                                new NfcATagRecoveryJournal(
+                                        new NfcATagRecoveryJournal.Storage() {
+                                            private byte[] bytes;
+
+                                            public byte[] read() {
+                                                return bytes;
+                                            }
+
+                                            public void write(byte[] value) {
+                                                bytes = value.clone();
+                                            }
+
+                                            public void clear() {
+                                                bytes = null;
+                                            }
+                                        }));
         when(mNfcInjector.getScreenStateHelper()).thenReturn(mScreenStateHelper);
         when(mNfcInjector.getNfcDiagnostics()).thenReturn(mNfcDiagnostics);
         when(mNfcInjector.getDeviceConfigFacade()).thenReturn(mDeviceConfigFacade);

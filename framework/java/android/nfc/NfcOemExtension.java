@@ -1110,9 +1110,20 @@ public final class NfcOemExtension {
         int rslt = NfcAdapter.callServiceReturn(
                 () -> NfcAdapter.sService.emulateNfcATag(enable, bitFrameSdd, platformConfig,
                         selInfo, nfcid1, rats, histBytes),
-                EMULATE_NFC_A_TAG_STATUS_OK);
+                EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL);
 
         return rslt;
+    }
+
+    /**
+     * Returns the service-owned Type-A emulation state, without controller writes.
+     * The versioned bundle reports active parameters and pending recovery.
+     * @hide
+     */
+    @RequiresPermission(Manifest.permission.WRITE_SECURE_SETTINGS)
+    public @Nullable Bundle getNfcATagEmulationState() {
+        return NfcAdapter.callServiceReturn(
+                () -> NfcAdapter.sService.getNfcATagEmulationState(), null);
     }
 
     /** @hide */

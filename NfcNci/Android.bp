@@ -3,6 +3,14 @@ package {
     default_applicable_licenses: ["Android-Apache-2.0"],
 }
 
+filegroup {
+    name: "nfc-a-emulation-controller-sources",
+    srcs: [
+        "src/com/android/nfc/NfcATagEmulationController.java",
+        "src/com/android/nfc/NfcATagRecoveryJournal.java",
+    ],
+}
+
 genrule {
     name: "statslog-Nfc-java-gen",
     tools: ["stats-log-api-gen"],

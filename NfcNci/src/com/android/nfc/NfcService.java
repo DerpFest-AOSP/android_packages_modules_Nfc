@@ -493,6 +493,10 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
     NfcInjector mNfcInjector;
     NfcEventLog mNfcEventLog;
     private DeviceHost mDeviceHost;
+    private final NfcATagEmulationController mNfcATagEmulationController;
+    private String mNfcAOperationFailure;
+    private boolean mNfcAUserSwitchPending;
+    private boolean mNfcADiscoveryRecoveryRequired;
     private GesturePollFrameObserver mGesturePollFrameObserver;
     private SharedPreferences mPrefs;
     private SharedPreferences.Editor mPrefsEditor;
@@ -1276,6 +1280,13 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
         mScreenStateHelper = mNfcInjector.getScreenStateHelper();
         mContentResolver = mContext.getContentResolver();
         mDeviceHost = mNfcInjector.makeDeviceHost(this);
+        mNfcATagEmulationController = new NfcATagEmulationController(
+                new NfcATagEmulationController.Configuration() {
+                    public byte[] get(int id) { return mDeviceHost.getNciConfig(id); }
+                    public boolean set(int id, byte[] value, boolean custom) {
+                        return mDeviceHost.setNciConfig(id, value, value.length, custom);
+                    }
+                }, mNfcInjector.makeNfcATagRecoveryJournal());
 
         mNfcUnlockManager = mNfcInjector.getNfcUnlockManager();
 
@@ -2045,6 +2056,18 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                 mTagObjectMap.clear();
             }
             synchronized (NfcService.this) {
+                mNfcADiscoveryRecoveryRequired = false;
+                mNfcAOperationFailure = null;
+                if (mNfcATagEmulationController.isActive()
+                        || mNfcATagEmulationController.needsRecovery()) {
+                    mDeviceHost.disableDiscovery();
+                    if (!mDeviceHost.isDiscoveryEnabled()) {
+                        mNfcATagEmulationController.restore();
+                    } else {
+                        mNfcADiscoveryRecoveryRequired = true;
+                        mNfcAOperationFailure = "discovery_failed";
+                    }
+                }
                 updateState(NfcAdapter.STATE_ON);
 
                 onPreferredPaymentChanged(NfcAdapter.PREFERRED_PAYMENT_LOADED);
@@ -2124,6 +2147,19 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
              * when the NFC controller stops responding */
             WatchDogThread watchDog = new WatchDogThread("disableInternal", ROUTING_WATCHDOG_MS);
             watchDog.start();
+
+            synchronized (NfcService.this) {
+                if (mNfcATagEmulationController.isActive()
+                        || mNfcATagEmulationController.needsRecovery()) {
+                    mDeviceHost.disableDiscovery();
+                    if (!mDeviceHost.isDiscoveryEnabled()) {
+                        mNfcATagEmulationController.restore();
+                    } else {
+                        mNfcADiscoveryRecoveryRequired = true;
+                        mNfcAOperationFailure = "discovery_failed";
+                    }
+                }
+            }
 
             if (mIsWlcEnabled) {
                 if (mNfcCharging.NfcChargingOnGoing == true) {
@@ -3194,6 +3230,23 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                     Log.e(TAG, "setReaderMode: called while NFC is not enabled.");
                     return;
                 }
+                if (flags != 0 && mNfcATagEmulationController.isActive()) {
+                    // A foreground reader must not leave a hidden identity session behind.
+                    WatchDogThread watchdog = new WatchDogThread(
+                            "restoreNfcATagForReader", ROUTING_WATCHDOG_MS);
+                    watchdog.start();
+                    try {
+                        mDeviceHost.disableDiscovery();
+                        if (mDeviceHost.isDiscoveryEnabled()
+                                || mNfcATagEmulationController.restore()
+                                        != NfcATagEmulationController.OK) {
+                            Log.w(TAG, "Reader mode deferred: Type-A restoration failed");
+                            return;
+                        }
+                    } finally {
+                        watchdog.cancel();
+                    }
+                }
                 if (flags != 0) {
                     try {
                         if (disablePolling) {
@@ -4022,67 +4075,95 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
         @Override
         public int emulateNfcATag(boolean setConfig, byte bitFrameSdd, byte platformConfig,
                 byte selInfo, byte[] nfcid1, byte rats, byte[] histBytes) {
-            Log.i(TAG, "emulateNfcACard: setConfig:" + setConfig);
             NfcPermissions.enforceAdminPermissions(mContext);
-            if (!isNfcEnabled()) {
-                Log.e(TAG, "emulateNfcACard: NFC is not enabled, ignore");
-                return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_NFC_NOT_ENABLED;
+            int caller = Binder.getCallingUid();
+            if (UserHandle.getUserHandleForUid(caller).getIdentifier() != getUserId()
+                    && caller != Process.SYSTEM_UID) {
+                throw new SecurityException("Only the foreground user may change NFC identity");
             }
-            byte[] param = new byte[1];
+            if (setConfig) NfcATagEmulationController.validate(nfcid1, histBytes);
             synchronized (NfcService.this) {
-                // stop discovery
-                mDeviceHost.disableDiscovery();
-
-                // Set parameters
-                if (setConfig) {
-                    // Indicate custom config
-                    param[0] = 0x00;
-                    mDeviceHost.setNciConfig(0x85, param, param.length, false);
-
-                    // LA_BIT_FRAME_SDD
-                    param[0] = bitFrameSdd;
-                    mDeviceHost.setNciConfig(0x30, param, param.length, true);
-
-                    // LA_PLATFORM_CONFIG
-                    param[0] = platformConfig;
-                    mDeviceHost.setNciConfig(0x31, param, param.length, true);
-
-                    // LA_SEL_INFO
-                    param[0] = selInfo;
-                    mDeviceHost.setNciConfig(0x32, param, param.length, true);
-
-                    // LA_NFCID1
-                    mDeviceHost.setNciConfig(0x33, nfcid1, nfcid1.length, true);
-
-                    // LI_A_RATS_TB1
-                    param[0] = rats;
-                    mDeviceHost.setNciConfig(0x58, param, param.length, true);
-
-                    // LI_A_HIST_BY
-                    if (histBytes != null) {
-                        mDeviceHost.setNciConfig(0x59, histBytes, histBytes.length, true);
-                    }
-                } else {
-                    // Reset custom config
-                    param[0] = 0x01;
-                    mDeviceHost.setNciConfig(0x85, param, param.length, false);
-
-                    nfcid1 = new byte[]{};
-                    mDeviceHost.setNciConfig(0x33, nfcid1, nfcid1.length, false);
-
-                    // LI_A_RATS_TB1
-                    param[0] = 0x0;
-                    mDeviceHost.setNciConfig(0x58, param, param.length, false);
-
-                    histBytes = new byte[]{};
-                    mDeviceHost.setNciConfig(0x59, histBytes, histBytes.length, false);
-
+                if ((UserHandle.getUserHandleForUid(caller).getIdentifier() != getUserId()
+                        && caller != Process.SYSTEM_UID) || mNfcAUserSwitchPending) {
+                    return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL;
                 }
-
-                applyRouting(true);
+                if (!isNfcEnabled()) {
+                    return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_NFC_NOT_ENABLED;
+                }
+                WatchDogThread watchdog = new WatchDogThread("emulateNfcATag", ROUTING_WATCHDOG_MS);
+                watchdog.start();
+                try {
+                    mNfcAOperationFailure = null;
+                    if (setConfig && (mReaderModeParams != null || NfcService.this.isTagPresent()
+                            || mNfcADiscoveryRecoveryRequired)) {
+                        mNfcAOperationFailure = "busy";
+                        return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL;
+                    }
+                    mDeviceHost.disableDiscovery();
+                    if (mDeviceHost.isDiscoveryEnabled()) {
+                        mNfcAOperationFailure = "discovery_failed";
+                        return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL;
+                    }
+                    int result = setConfig ? mNfcATagEmulationController.apply(caller,
+                            bitFrameSdd, platformConfig, selInfo, nfcid1, rats, histBytes)
+                            : mNfcATagEmulationController.restore();
+                    if (!mNfcATagEmulationController.needsRecovery()) {
+                        mNfcADiscoveryRecoveryRequired = false;
+                        applyRouting(true);
+                        boolean expectedDiscovery = computeDiscoveryParameters(mScreenState)
+                                .shouldEnableDiscovery();
+                        if (expectedDiscovery != mDeviceHost.isDiscoveryEnabled()) {
+                            // No identity may be advertised after a failed RF restart.
+                            mNfcAOperationFailure = "discovery_failed";
+                            mNfcADiscoveryRecoveryRequired = true;
+                            mDeviceHost.disableDiscovery();
+                            mNfcATagEmulationController.restore();
+                            return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL;
+                        }
+                    }
+                    return result;
+                } finally {
+                    watchdog.cancel();
+                }
             }
+        }
 
-            return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_OK;
+        @Override
+        public Bundle getNfcATagEmulationState() {
+            NfcPermissions.enforceAdminPermissions(mContext);
+            int caller = Binder.getCallingUid();
+            if (UserHandle.getUserHandleForUid(caller).getIdentifier() != getUserId()
+                    && caller != Process.SYSTEM_UID) {
+                throw new SecurityException("Only the foreground user may inspect NFC identity");
+            }
+            synchronized (NfcService.this) {
+                if (UserHandle.getUserHandleForUid(caller).getIdentifier() != getUserId()
+                        && caller != Process.SYSTEM_UID) {
+                    throw new SecurityException("Foreground user changed");
+                }
+                Bundle state = new Bundle();
+                state.putInt("version", 1);
+                state.putBoolean("transitioning", mNfcAUserSwitchPending);
+                if (mNfcAUserSwitchPending) return state;
+                boolean active = isNfcEnabled() && mNfcATagEmulationController.isActive();
+                boolean recovery = mNfcATagEmulationController.needsRecovery()
+                        || mNfcADiscoveryRecoveryRequired
+                        || (active && !mDeviceHost.isDiscoveryEnabled());
+                state.putBoolean("reading", mReaderModeParams != null);
+                state.putString("failure_reason", mDeviceHost.isNciConfigTimedOut() ? "timeout"
+                        : mNfcAOperationFailure != null ? mNfcAOperationFailure
+                        : mNfcATagEmulationController.failureReason());
+                state.putInt("failed_parameter", mNfcATagEmulationController.failedParameter());
+                state.putBoolean("active", active && !recovery);
+                state.putBoolean("recovery_required", recovery);
+                state.putLong("generation", mNfcATagEmulationController.generation());
+                state.putInt("owner_uid", mNfcATagEmulationController.ownerUid());
+                state.putByteArray("uid", mNfcATagEmulationController.activeParameter(0x33));
+                state.putByteArray("bit_frame_sdd", mNfcATagEmulationController.activeParameter(0x30));
+                state.putByteArray("platform_config", mNfcATagEmulationController.activeParameter(0x31));
+                state.putByteArray("sel_info", mNfcATagEmulationController.activeParameter(0x32));
+                return state;
+            }
         }
 
         private void updateNfCState() {
@@ -5051,6 +5132,11 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
             if (mNfcOemExtensionCallback != null
                    && receiveOemCallbackResult(ACTION_ON_APPLY_ROUTING)) {
                 Log.d(TAG, "applyRouting: skip due to oem callback");
+                return;
+            }
+            if (mNfcAUserSwitchPending || mNfcADiscoveryRecoveryRequired
+                    || mNfcATagEmulationController.needsRecovery()) {
+                mDeviceHost.disableDiscovery();
                 return;
             }
             refreshTagDispatcherInProvisionMode();
@@ -6685,7 +6771,35 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                 }
             } else if (action.equals(Intent.ACTION_USER_SWITCHED)) {
                 int userId = intent.getIntExtra(Intent.EXTRA_USER_HANDLE, 0);
-                mUserId = userId;
+                synchronized (NfcService.this) {
+                    mUserId = userId;
+                    mNfcAUserSwitchPending = mNfcATagEmulationController.isActive()
+                            || mNfcATagEmulationController.needsRecovery();
+                }
+                AsyncTask.THREAD_POOL_EXECUTOR.execute(() -> {
+                    synchronized (NfcService.this) {
+                        if (mUserId != userId) return;
+                        WatchDogThread watchdog = new WatchDogThread(
+                                "restoreNfcAOnUserSwitch", ROUTING_WATCHDOG_MS);
+                        watchdog.start();
+                        try {
+                            if (mNfcATagEmulationController.isActive()
+                                    || mNfcATagEmulationController.needsRecovery()) {
+                                mDeviceHost.disableDiscovery();
+                                if (!mDeviceHost.isDiscoveryEnabled()) {
+                                    mNfcATagEmulationController.restore();
+                                } else {
+                                    mNfcADiscoveryRecoveryRequired = true;
+                                    mNfcAOperationFailure = "discovery_failed";
+                                }
+                            }
+                            mNfcAUserSwitchPending = false;
+                            applyRouting(true);
+                        } finally {
+                            watchdog.cancel();
+                        }
+                    }
+                });
                 updatePackageCache();
                 if (DBG) Log.d(TAG, action + "mReceiver.onReceive: UserId: " + userId);
                 if (mIsHceCapable) {
@@ -7022,6 +7136,20 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
         pw.println("mState=" + stateToString(mState.get()));
         pw.println("mAlwaysOnState=" + stateToString(mAlwaysOnState));
         pw.println("mScreenState=" + ScreenStateHelper.screenStateToString(mScreenState));
+        synchronized (this) {
+            // Keep card identifiers out of diagnostics.
+            pw.println("NfcAEmulation: active=" + mNfcATagEmulationController.isActive()
+                    + " recovery_required=" + (mNfcATagEmulationController.needsRecovery()
+                            || mNfcADiscoveryRecoveryRequired)
+                    + " user_switch_pending=" + mNfcAUserSwitchPending
+                    + " rf_discovery=" + mDeviceHost.isDiscoveryEnabled()
+                    + " generation=" + mNfcATagEmulationController.generation()
+                    + " reading=" + (mReaderModeParams != null)
+                    + " failure=" + (mDeviceHost.isNciConfigTimedOut() ? "timeout"
+                            : mNfcAOperationFailure != null ? mNfcAOperationFailure
+                            : mNfcATagEmulationController.failureReason())
+                    + " parameter=" + mNfcATagEmulationController.failedParameter());
+        }
         pw.println("mIsSecureNfcEnabled=" + mIsSecureNfcEnabled);
         pw.println("mIsReaderOptionEnabled=" + mIsReaderOptionEnabled);
         pw.println("mIsAlwaysOnSupported=" + mIsAlwaysOnSupported);

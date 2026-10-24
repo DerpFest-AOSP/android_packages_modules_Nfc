@@ -173,6 +173,9 @@ public interface DeviceHost {
 
     public void disableDiscovery();
 
+    /** Whether the controller acknowledged that RF discovery is running. */
+    public boolean isDiscoveryEnabled();
+
     public boolean sendRawFrame(byte[] data);
 
     public boolean routeAid(byte[] aid, int route, int aidInfo, int power);
@@ -358,7 +361,12 @@ public interface DeviceHost {
     /**
      * Send NCI config update command
      */
-    void setNciConfig(int paramId, byte[] param, int length, boolean custom);
+    boolean isNciConfigTimedOut();
+
+    boolean setNciConfig(int paramId, byte[] param, int length, boolean custom);
+
+    /** Read a configuration parameter without changing controller state. */
+    byte[] getNciConfig(int paramId);
 
     /**
     * Get the committed rf discover configuration

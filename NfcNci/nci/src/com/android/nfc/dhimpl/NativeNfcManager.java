@@ -397,6 +397,9 @@ public class NativeNfcManager implements DeviceHost {
     @Override
     public native void disableDiscovery();
 
+    @Override
+    public native boolean isDiscoveryEnabled();
+
     private native void doResetTimeouts();
 
     @Override
@@ -729,7 +732,12 @@ public class NativeNfcManager implements DeviceHost {
     }
 
     @Override
-    public native void setNciConfig(int paramId, byte[] param, int length, boolean custom);
+    public native boolean isNciConfigTimedOut();
+
+    public native boolean setNciConfig(int paramId, byte[] param, int length, boolean custom);
+
+    @Override
+    public native byte[] getNciConfig(int paramId);
 
     @Override
     public native byte[] getRfDiscoverConfig();

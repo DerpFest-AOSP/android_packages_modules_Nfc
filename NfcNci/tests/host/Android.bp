@@ -1,0 +1,10 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+java_test_host {
+    name: "NfcATagEmulationControllerTests",
+    srcs: ["src/**/*.java", ":nfc-a-emulation-controller-sources"],
+    static_libs: ["junit"],
+    test_suites: ["general-tests"],
+}

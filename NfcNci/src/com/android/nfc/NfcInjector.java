@@ -143,6 +143,69 @@ public class NfcInjector {
         sInstance = this;
     }
 
+    private static void syncNfcDataDirectory() throws java.io.IOException {
+        try {
+            java.io.FileDescriptor directory =
+                    android.system.Os.open(
+                            NFC_DATA_DIR,
+                            android.system.OsConstants.O_RDONLY | android.system.OsConstants.O_CLOEXEC,
+                            0);
+            try {
+                android.system.Os.fsync(directory);
+            } finally {
+                android.system.Os.close(directory);
+            }
+        } catch (android.system.ErrnoException e) {
+            throw e.rethrowAsIOException();
+        }
+    }
+
+    NfcATagRecoveryJournal makeNfcATagRecoveryJournal() {
+        AtomicFile file = new AtomicFile(new File(NFC_DATA_DIR, "nfc_a_recovery.bin"));
+        return new NfcATagRecoveryJournal(
+                new NfcATagRecoveryJournal.Storage() {
+                    public byte[] read() throws java.io.IOException {
+                        try (java.io.FileInputStream input = file.openRead()) {
+                            return input.readNBytes(513);
+                        } catch (java.io.FileNotFoundException e) {
+                            if (!java.nio.file.Files.notExists(file.getBaseFile().toPath())) throw e;
+                            return null;
+                        }
+                    }
+
+                    public void write(byte[] bytes) throws java.io.IOException {
+                        java.io.FileOutputStream output = file.startWrite();
+                        try {
+                            try {
+                                android.system.Os.fchmod(output.getFD(), 0600);
+                            } catch (android.system.ErrnoException e) {
+                                throw e.rethrowAsIOException();
+                            }
+                            output.write(bytes);
+                            output.getFD().sync();
+                            file.finishWrite(output);
+                            syncNfcDataDirectory();
+                            try (java.io.FileInputStream input = file.openRead()) {
+                                if (!java.util.Arrays.equals(bytes, input.readNBytes(513))) {
+                                    throw new java.io.IOException("Recovery journal commit failed");
+                                }
+                            }
+                        } catch (java.io.IOException e) {
+                            file.failWrite(output);
+                            throw e;
+                        }
+                    }
+
+                    public void clear() throws java.io.IOException {
+                        file.delete();
+                        if (!java.nio.file.Files.notExists(file.getBaseFile().toPath())) {
+                            throw new java.io.IOException("Recovery journal still exists");
+                        }
+                        syncNfcDataDirectory();
+                    }
+                });
+    }
+
     public CardEmulationManager getCardEmulationManager() {
         if (mCardEmulationManager == null) {
             mCardEmulationManager = new CardEmulationManager(mContext, sInstance, mDeviceConfigFacade);
