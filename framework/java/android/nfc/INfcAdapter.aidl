@@ -140,4 +140,5 @@ interface INfcAdapter
     void allowOneTransaction();
     List<RfDiscoverConfig> getRfDiscoverConfigurations();
     Bundle getNfcATagEmulationState();
+    boolean setNfcATagDiagnosticsEnabled(boolean enabled);
 }

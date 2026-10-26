@@ -1126,6 +1126,17 @@ public final class NfcOemExtension {
                 () -> NfcAdapter.sService.getNfcATagEmulationState(), null);
     }
 
+    /**
+     * Enables bounded RF metadata for the calling foreground user. Renew within two minutes.
+     * Does not change discovery, routing, controller parameters or OEM startup callbacks.
+     * @hide
+     */
+    @RequiresPermission(Manifest.permission.WRITE_SECURE_SETTINGS)
+    public boolean setNfcATagDiagnosticsEnabled(boolean enabled) {
+        return NfcAdapter.callServiceReturn(
+                () -> NfcAdapter.sService.setNfcATagDiagnosticsEnabled(enabled), false);
+    }
+
     /** @hide */
     public final class NfcOemExtensionCallback extends INfcOemExtensionCallback.Stub {
 

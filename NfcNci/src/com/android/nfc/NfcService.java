@@ -494,6 +494,8 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
     NfcEventLog mNfcEventLog;
     private DeviceHost mDeviceHost;
     private final NfcATagEmulationController mNfcATagEmulationController;
+    private final NfcADiagnosticTrace mNfcADiagnosticTrace = new NfcADiagnosticTrace(
+            System::currentTimeMillis, SystemClock::elapsedRealtime);
     private String mNfcAOperationFailure;
     private boolean mNfcAUserSwitchPending;
     private boolean mNfcADiscoveryRecoveryRequired;
@@ -657,6 +659,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
      */
     @Override
     public void onHostCardEmulationActivated(int technology) {
+        mNfcADiagnosticTrace.record(NfcADiagnosticTrace.Event.HOST_ACTIVATED, technology, 0);
         mCardEmulationActivated = true;
         try {
             if (mNfcOemExtensionCallback != null) {
@@ -682,6 +685,8 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
 
     @Override
     public void onHostCardEmulationData(int technology, byte[] data) {
+        mNfcADiagnosticTrace.record(NfcADiagnosticTrace.Event.HOST_DATA,
+                technology, data == null ? 0 : data.length);
         if (mCardEmulationManager != null) {
             mCardEmulationManager.onHostCardEmulationData(technology, data);
             if (android.nfc.Flags.nfcPersistLog() && NFC_VENDOR_DEBUG_ENABLED) {
@@ -699,6 +704,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
 
     @Override
     public void onHostCardEmulationDeactivated(int technology) {
+        mNfcADiagnosticTrace.record(NfcADiagnosticTrace.Event.HOST_DEACTIVATED, technology, 0);
         mCardEmulationActivated = false;
         try {
             if (mNfcOemExtensionCallback != null) {
@@ -739,6 +745,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
 
     @Override
     public void onRemoteFieldActivated() {
+        mNfcADiagnosticTrace.record(NfcADiagnosticTrace.Event.FIELD_ON, 0, 0);
         mRfFieldActivated = true;
         mLastFieldOnTimestamp = mNfcInjector.getWallClockMillis();
         mNfcInjector.ensureWatchdogMonitoring();
@@ -773,6 +780,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
 
     @Override
     public void onRemoteFieldDeactivated() {
+        mNfcADiagnosticTrace.record(NfcADiagnosticTrace.Event.FIELD_OFF, 0, 0);
         mRfFieldActivated = false;
         try {
             if (mNfcOemExtensionCallback != null) {
@@ -960,6 +968,8 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
 
     @Override
     public void onEeListenActivated(boolean isActivated) {
+        mNfcADiagnosticTrace.record(isActivated ? NfcADiagnosticTrace.Event.EE_LISTEN_ON
+                : NfcADiagnosticTrace.Event.EE_LISTEN_OFF, 0, 0);
         mEeListenActivated = isActivated;
         mCardEmulationManager.onEeListenActivated(isActivated);
         try {
@@ -973,6 +983,8 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
 
     @Override
     public void onRfDiscoveryEvent(boolean isDiscoveryStarted) {
+        mNfcADiagnosticTrace.record(NfcADiagnosticTrace.Event.RF_DISCOVERY,
+                isDiscoveryStarted ? 1 : 0, 0);
         synchronized (mDiscoveryLock) {
             mRfDiscoveryStarted = isDiscoveryStarted;
         }
@@ -4099,6 +4111,8 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                         mNfcAOperationFailure = "busy";
                         return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL;
                     }
+                    mNfcADiagnosticTrace.record(NfcADiagnosticTrace.Event.APPLY_START,
+                            setConfig ? 1 : 0, mScreenState);
                     mDeviceHost.disableDiscovery();
                     if (mDeviceHost.isDiscoveryEnabled()) {
                         mNfcAOperationFailure = "discovery_failed";
@@ -4121,10 +4135,28 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                             return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL;
                         }
                     }
+                    mNfcADiagnosticTrace.record(NfcADiagnosticTrace.Event.APPLY_END,
+                            result, mDeviceHost.isDiscoveryEnabled() ? 1 : 0);
                     return result;
                 } finally {
                     watchdog.cancel();
                 }
+            }
+        }
+
+        @Override
+        public boolean setNfcATagDiagnosticsEnabled(boolean enabled) {
+            NfcPermissions.enforceAdminPermissions(mContext);
+            int caller = Binder.getCallingUid();
+            synchronized (NfcService.this) {
+                if (UserHandle.getUserHandleForUid(caller).getIdentifier() != getUserId()
+                        || mNfcAUserSwitchPending) {
+                    throw new SecurityException(
+                            "Only the foreground user may record NFC diagnostics");
+                }
+                boolean accepted = mNfcADiagnosticTrace.enable(caller, enabled);
+                if (enabled && accepted) Log.i(TAG, "NFC diagnostic recording lease active");
+                return accepted;
             }
         }
 
@@ -4143,6 +4175,16 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                 }
                 Bundle state = new Bundle();
                 state.putInt("version", 1);
+                state.putInt("diagnostics_version", 1);
+                state.putString("diagnostic_instance", mNfcADiagnosticTrace.instance());
+                state.putString("diagnostic_events", mNfcADiagnosticTrace.export(caller));
+                state.putBoolean("rf_field", mRfFieldActivated);
+                state.putBoolean("host_activated", mCardEmulationActivated);
+                state.putBoolean("ee_listen", mEeListenActivated);
+                state.putBoolean("rf_discovery", mDeviceHost.isDiscoveryEnabled());
+                state.putInt("screen_state", mScreenState);
+                state.putInt("listen_tech", getNfcListenTech());
+                state.putInt("poll_tech", getNfcPollTech());
                 state.putBoolean("transitioning", mNfcAUserSwitchPending);
                 if (mNfcAUserSwitchPending) return state;
                 boolean active = isNfcEnabled() && mNfcATagEmulationController.isActive();
@@ -5171,6 +5213,9 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                         mDeviceHost.disableDiscovery();
                     }
                     mCurrentDiscoveryParameters = newParams;
+                    mNfcADiagnosticTrace.record(NfcADiagnosticTrace.Event.DISCOVERY,
+                            newParams.shouldEnableHostRouting() ? 1 : 0,
+                            mDeviceHost.isDiscoveryEnabled() ? 1 : 0);
                 } else {
                     Log.d(TAG, "applyRouting: Discovery configuration equal, not updating");
                 }
@@ -6773,6 +6818,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                 int userId = intent.getIntExtra(Intent.EXTRA_USER_HANDLE, 0);
                 synchronized (NfcService.this) {
                     mUserId = userId;
+                    mNfcADiagnosticTrace.clear();
                     mNfcAUserSwitchPending = mNfcATagEmulationController.isActive()
                             || mNfcATagEmulationController.needsRecovery();
                 }
