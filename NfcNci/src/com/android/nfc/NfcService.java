@@ -321,6 +321,11 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
     // goes off
     static final int ROUTING_WATCHDOG_MS = 6000;
 
+    // Discovery stop waits up to 5s and a config round-trip waits up to 2s.
+    // applyRouting then arms its own routing watchdog, so a Type-A transaction
+    // has to outlast both or a slow controller aborts the NFC process.
+    static final int NFC_A_TRANSACTION_WATCHDOG_MS = 15000;
+
     // Default delay used for presence checks
     static final int DEFAULT_PRESENCE_CHECK_DELAY = 125;
 
@@ -2567,7 +2572,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
 
     private void restoreNfcATagForBackground() {
         WatchDogThread watchdog = new WatchDogThread("restoreNfcATagForBackground",
-                ROUTING_WATCHDOG_MS);
+                NFC_A_TRANSACTION_WATCHDOG_MS);
         watchdog.start();
         try {
             mNfcAOperationFailure = null;
@@ -3343,7 +3348,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                 if (flags != 0 && mNfcATagEmulationController.isActive()) {
                     // A foreground reader must not leave a hidden identity session behind.
                     WatchDogThread watchdog = new WatchDogThread(
-                            "restoreNfcATagForReader", ROUTING_WATCHDOG_MS);
+                            "restoreNfcATagForReader", NFC_A_TRANSACTION_WATCHDOG_MS);
                     watchdog.start();
                     try {
                         mDeviceHost.disableDiscovery();
@@ -4210,7 +4215,8 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                     }
                     mNfcAForegroundUid = caller;
                 }
-                WatchDogThread watchdog = new WatchDogThread("emulateNfcATag", ROUTING_WATCHDOG_MS);
+                WatchDogThread watchdog = new WatchDogThread("emulateNfcATag",
+                        NFC_A_TRANSACTION_WATCHDOG_MS);
                 watchdog.start();
                 try {
                     mNfcAOperationFailure = null;
@@ -6971,7 +6977,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                     synchronized (NfcService.this) {
                         if (mUserId != userId) return;
                         WatchDogThread watchdog = new WatchDogThread(
-                                "restoreNfcAOnUserSwitch", ROUTING_WATCHDOG_MS);
+                                "restoreNfcAOnUserSwitch", NFC_A_TRANSACTION_WATCHDOG_MS);
                         watchdog.start();
                         try {
                             if (mNfcATagEmulationController.isActive()
