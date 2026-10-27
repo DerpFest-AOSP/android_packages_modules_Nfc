@@ -453,7 +453,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
     ReaderModeParams mReaderModeParams;
     DiscoveryTechParams mDiscoveryTechParams;
 
-    private int mUserId;
+    private volatile int mUserId;
     boolean mPollingPaused;
 
     // True if nfc notification message already shown
@@ -496,9 +496,10 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
     private final NfcATagEmulationController mNfcATagEmulationController;
     private final NfcADiagnosticTrace mNfcADiagnosticTrace = new NfcADiagnosticTrace(
             System::currentTimeMillis, SystemClock::elapsedRealtime);
+    private final NfcATagFeedback mNfcATagFeedback = new NfcATagFeedback();
     private String mNfcAOperationFailure;
-    private boolean mNfcAUserSwitchPending;
-    private boolean mNfcADiscoveryRecoveryRequired;
+    private volatile boolean mNfcAUserSwitchPending;
+    private volatile boolean mNfcADiscoveryRecoveryRequired;
     private GesturePollFrameObserver mGesturePollFrameObserver;
     private SharedPreferences mPrefs;
     private SharedPreferences.Editor mPrefsEditor;
@@ -903,6 +904,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
 
     @Override
     public void onHwErrorReported() {
+        playNfcATagErrorFeedback();
         if (android.nfc.Flags.nfcEventListener() && mCardEmulationManager != null) {
             mCardEmulationManager.onInternalErrorReported(
                     CardEmulation.NFC_INTERNAL_ERROR_NFC_HARDWARE_ERROR);
@@ -913,9 +915,46 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
     @FlaggedApi(android.nfc.Flags.FLAG_NFC_EVENT_LISTENER)
     @Override
     public void onCommandTimeout() {
+        playNfcATagErrorFeedback();
         if (android.nfc.Flags.nfcEventListener() && mCardEmulationManager != null) {
             mCardEmulationManager.onInternalErrorReported(
                     CardEmulation.NFC_INTERNAL_ERROR_COMMAND_TIMEOUT);
+        }
+    }
+
+    // The native layer may abort immediately after this callback. Do not queue feedback,
+    // take the service lock or delay recovery while a controller response is outstanding.
+    private void playNfcATagErrorFeedback() {
+        int owner = mNfcATagEmulationController.ownerUid();
+        boolean active = mNfcATagEmulationController.isActive()
+                && !mNfcAUserSwitchPending && !mNfcADiscoveryRecoveryRequired
+                && owner >= 0 && UserHandle.getUserHandleForUid(owner).getIdentifier() == mUserId;
+        vibrateNfcATagFeedback(mNfcATagFeedback.error(active,
+                mNfcATagEmulationController.generation(), SystemClock.elapsedRealtime()));
+    }
+
+    private void handleNfcATagFieldFeedback(boolean fieldOn) {
+        int duration;
+        synchronized (NfcService.this) {
+            int owner = mNfcATagEmulationController.ownerUid();
+            boolean active = isNfcEnabled() && mNfcATagEmulationController.isActive()
+                    && !mNfcATagEmulationController.needsRecovery()
+                    && !mNfcADiscoveryRecoveryRequired && !mNfcAUserSwitchPending
+                    && owner >= 0 && UserHandle.getUserHandleForUid(owner).getIdentifier() == getUserId();
+            long generation = mNfcATagEmulationController.generation();
+            long now = SystemClock.elapsedRealtime();
+            duration = mNfcATagFeedback.fieldChanged(active, generation, fieldOn, now);
+        }
+        vibrateNfcATagFeedback(duration);
+    }
+
+    private void vibrateNfcATagFeedback(int duration) {
+        if (duration == 0 || mVibrator == null) return;
+        try {
+            mVibrator.vibrate(VibrationEffect.createOneShot(duration,
+                    VibrationEffect.DEFAULT_AMPLITUDE), HARDWARE_FEEDBACK_VIBRATION_ATTRIBUTES);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Type-A haptic feedback unavailable", e);
         }
     }
 
@@ -5997,6 +6036,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
 
                 case MSG_RF_FIELD_ACTIVATED:
                     Log.d(TAG, "handleMessage: MSG_RF_FIELD_ACTIVATED");
+                    handleNfcATagFieldFeedback(true);
                     notifyOemLogEvent(new OemLogItems
                             .Builder(OemLogItems.LOG_ACTION_RF_FIELD_STATE_CHANGED)
                             .setRfFieldOnTime(Instant.now()).build());
@@ -6010,6 +6050,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                     break;
                 case MSG_RF_FIELD_DEACTIVATED:
                     Log.d(TAG, "handleMessage: MSG_RF_FIELD_DEACTIVATED");
+                    handleNfcATagFieldFeedback(false);
                     notifyOemLogEvent(new OemLogItems
                             .Builder(OemLogItems.LOG_ACTION_RF_FIELD_STATE_CHANGED)
                             .setRfFieldOnTime(Instant.EPOCH).build());

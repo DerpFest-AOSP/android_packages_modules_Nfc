@@ -27,10 +27,11 @@ final class NfcATagEmulationController {
     private String mFailure;
     private int mFailedParameter = -1;
     private final LinkedHashMap<Integer, byte[]> mBaseline = new LinkedHashMap<>();
-    private LinkedHashMap<Integer, byte[]> mActive;
-    private boolean mRecoveryRequired;
-    private long mGeneration;
-    private int mOwnerUid = -1;
+    // Error callbacks must inspect these without waiting on an in-flight NFC transaction.
+    private volatile LinkedHashMap<Integer, byte[]> mActive;
+    private volatile boolean mRecoveryRequired;
+    private volatile long mGeneration;
+    private volatile int mOwnerUid = -1;
 
     NfcATagEmulationController(Configuration configuration, NfcATagRecoveryJournal journal) {
         mConfiguration = configuration;

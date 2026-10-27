@@ -9,6 +9,7 @@ filegroup {
         "src/com/android/nfc/NfcATagEmulationController.java",
         "src/com/android/nfc/NfcATagRecoveryJournal.java",
         "src/com/android/nfc/NfcADiagnosticTrace.java",
+        "src/com/android/nfc/NfcATagFeedback.java",
     ],
 }
 
