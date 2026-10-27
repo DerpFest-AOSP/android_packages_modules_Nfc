@@ -2555,9 +2555,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
             mNfcATagEmulationController.restore();
             if (!mNfcATagEmulationController.needsRecovery()) {
                 mNfcADiscoveryRecoveryRequired = false;
-                applyRouting(true);
-                if (isNfcEnabled() && computeDiscoveryParameters(mScreenState)
-                        .shouldEnableDiscovery() != mDeviceHost.isDiscoveryEnabled()) {
+                if (applyRoutingWithResult(true) == RoutingResult.FAILED) {
                     mNfcADiscoveryRecoveryRequired = true;
                     mNfcAOperationFailure = "discovery_failed";
                     mDeviceHost.disableDiscovery();
@@ -2598,9 +2596,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                 int result = mNfcATagEmulationController.recover(known);
                 if (result != NfcATagEmulationController.OK) return result;
                 mNfcADiscoveryRecoveryRequired = false;
-                applyRouting(true);
-                if (computeDiscoveryParameters(mScreenState).shouldEnableDiscovery()
-                        != mDeviceHost.isDiscoveryEnabled()) {
+                if (applyRoutingWithResult(true) == RoutingResult.FAILED) {
                     mNfcADiscoveryRecoveryRequired = true;
                     mNfcAOperationFailure = "discovery_failed";
                     mDeviceHost.disableDiscovery();
@@ -4257,10 +4253,14 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                             : mNfcATagEmulationController.restore();
                     if (!mNfcATagEmulationController.needsRecovery()) {
                         mNfcADiscoveryRecoveryRequired = false;
-                        applyRouting(true);
-                        boolean expectedDiscovery = computeDiscoveryParameters(mScreenState)
-                                .shouldEnableDiscovery();
-                        if (expectedDiscovery != mDeviceHost.isDiscoveryEnabled()) {
+                        RoutingResult routing = applyRoutingWithResult(true);
+                        if (routing == RoutingResult.DEFERRED && setConfig) {
+                            // A policy skip is not a controller failure or an active identity.
+                            mNfcAOperationFailure = "busy";
+                            mNfcATagEmulationController.restore();
+                            return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL;
+                        }
+                        if (routing == RoutingResult.FAILED) {
                             // No identity may be advertised after a failed RF restart.
                             mNfcAOperationFailure = "discovery_failed";
                             mNfcADiscoveryRecoveryRequired = true;
@@ -5297,30 +5297,38 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
      * Read mScreenState and apply NFC-C polling and NFC-EE routing
      */
     void applyRouting(boolean force) {
+        applyRoutingWithResult(force);
+    }
+
+    enum RoutingResult { APPLIED, DEFERRED, FAILED }
+
+    /** Separates policy deferral from a failed controller update. */
+    RoutingResult applyRoutingWithResult(boolean force) {
         if (DBG) {
             Log.d(TAG, "applyRouting");
         }
         synchronized (this) {
             if (!isNfcEnabled()) {
                 Log.d(TAG, "applyRouting: skip because nfc is not enabled");
-                return;
+                return RoutingResult.DEFERRED;
+            }
+            if (mNfcAUserSwitchPending || mNfcATagEmulationController.needsRecovery()
+                    || (mNfcADiscoveryRecoveryRequired
+                        && mNfcATagEmulationController.isActive())) {
+                mDeviceHost.disableDiscovery();
+                return RoutingResult.FAILED;
             }
             if (mNfcOemExtensionCallback != null
-                   && receiveOemCallbackResult(ACTION_ON_APPLY_ROUTING)) {
+                    && receiveOemCallbackResult(ACTION_ON_APPLY_ROUTING)) {
                 Log.d(TAG, "applyRouting: skip due to oem callback");
-                return;
-            }
-            if (mNfcAUserSwitchPending || mNfcADiscoveryRecoveryRequired
-                    || mNfcATagEmulationController.needsRecovery()) {
-                mDeviceHost.disableDiscovery();
-                return;
+                return RoutingResult.DEFERRED;
             }
             refreshTagDispatcherInProvisionMode();
             boolean privilegedCaller = NfcInjector.isPrivileged(Binder.getCallingUid())
                     || NfcPermissions.checkAdminPermissions(mContext);
             if (mPollingPaused && !privilegedCaller) {
                 Log.d(TAG, "applyRouting: Not updating discovery parameters, polling paused");
-                return;
+                return RoutingResult.DEFERRED;
             }
             // Special case: if we're transitioning to unlocked state while
             // still talking to a tag, postpone re-configuration.
@@ -5328,7 +5336,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                 Log.d(TAG, "applyRouting: Not updating discovery parameters, tag connected");
                 mHandler.sendMessageDelayed(mHandler.obtainMessage(MSG_RESUME_POLLING),
                         APPLY_ROUTING_RETRY_TIMEOUT_MS);
-                return;
+                return RoutingResult.DEFERRED;
             }
 
             synchronized (mRoutingWatchDogLock) {
@@ -5339,20 +5347,31 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
             try {
                 // Compute new polling parameters
                 NfcDiscoveryParameters newParams = computeDiscoveryParameters(mScreenState);
-                if (force || !newParams.equals(mCurrentDiscoveryParameters)) {
+                if (force || mNfcADiscoveryRecoveryRequired
+                        || !newParams.equals(mCurrentDiscoveryParameters)
+                        || newParams.shouldEnableDiscovery() != mDeviceHost.isDiscoveryEnabled()) {
                     if (newParams.shouldEnableDiscovery()) {
                         boolean shouldRestart = mCurrentDiscoveryParameters.shouldEnableDiscovery();
                         mDeviceHost.enableDiscovery(newParams, shouldRestart);
                     } else {
                         mDeviceHost.disableDiscovery();
                     }
-                    mCurrentDiscoveryParameters = newParams;
                     mNfcADiagnosticTrace.record(NfcADiagnosticTrace.Event.DISCOVERY,
                             newParams.shouldEnableHostRouting() ? 1 : 0,
                             mDeviceHost.isDiscoveryEnabled() ? 1 : 0);
                 } else {
                     Log.d(TAG, "applyRouting: Discovery configuration equal, not updating");
                 }
+                if (newParams.shouldEnableDiscovery() != mDeviceHost.isDiscoveryEnabled()) {
+                    mNfcADiscoveryRecoveryRequired = true;
+                    mNfcAOperationFailure = "discovery_failed";
+                    mDeviceHost.disableDiscovery();
+                    return RoutingResult.FAILED;
+                }
+                mCurrentDiscoveryParameters = newParams;
+                mNfcADiscoveryRecoveryRequired = false;
+                if ("discovery_failed".equals(mNfcAOperationFailure)) mNfcAOperationFailure = null;
+                return RoutingResult.APPLIED;
             } finally {
                 cancelRoutingWatchDog();
             }
