@@ -2050,6 +2050,8 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
 
             WatchDogThread watchDog = new WatchDogThread("enableInternal", INIT_WATCHDOG_MS);
             watchDog.start();
+            // True only after initialize(), which resets the controller to its baseline.
+            boolean controllerReset = false;
 
             if (mIsHceCapable) {
                 mCardEmulationManager.updateForDefaultSwpToEuicc();
@@ -2076,6 +2078,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                             updateState(NfcAdapter.STATE_OFF);
                             return false;
                         }
+                        controllerReset = true;
                     } else if (mAlwaysOnState == NfcAdapter.STATE_ON
                             || mAlwaysOnState == NfcAdapter.STATE_TURNING_OFF) {
                         Log.i(TAG, "enableInternal: Already initialized");
@@ -2118,6 +2121,25 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                     mDeviceHost.disableDiscovery();
                     if (!mDeviceHost.isDiscoveryEnabled()) {
                         mNfcATagEmulationController.restore();
+                        if (controllerReset
+                                && mNfcATagEmulationController.needsRecovery()
+                                && "journal_unavailable".equals(
+                                        mNfcATagEmulationController.failureReason())) {
+                            if (mNfcATagEmulationController.recaptureBaselineAfterReset()) {
+                                Log.i(TAG, "Replaced an unreadable Type-A recovery journal "
+                                        + "after controller reset");
+                            } else {
+                                Log.w(TAG, "Type-A recovery journal remains unreadable "
+                                        + "after controller reset");
+                            }
+                        }
+                        if (mNfcATagEmulationController.needsRecovery()) {
+                            mNfcADiscoveryRecoveryRequired = true;
+                            if (mNfcAOperationFailure == null) {
+                                mNfcAOperationFailure =
+                                        mNfcATagEmulationController.failureReason();
+                            }
+                        }
                     } else {
                         mNfcADiscoveryRecoveryRequired = true;
                         mNfcAOperationFailure = "discovery_failed";

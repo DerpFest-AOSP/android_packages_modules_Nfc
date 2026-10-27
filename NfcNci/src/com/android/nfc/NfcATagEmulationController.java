@@ -167,6 +167,52 @@ final class NfcATagEmulationController {
         return OK;
     }
 
+    /**
+     * Replaces an unreadable journal after the controller has been reset.
+     * The values read here are the reset baseline. Call this only after that reset;
+     * otherwise a custom identity still on the controller would be treated as original.
+     *
+     * @return true when the journal was removed and discovery may resume
+     */
+    boolean recaptureBaselineAfterReset() {
+        LinkedHashMap<Integer, byte[]> baseline = new LinkedHashMap<>();
+        for (int id : new int[] {CONFIG_CONTROL, 0x30, 0x31, 0x32, 0x33}) {
+            byte[] value = mConfiguration.get(id);
+            if (!validValue(id, value)) {
+                mFailure = "snapshot_unavailable";
+                mFailedParameter = id;
+                mRecoveryRequired = true;
+                return false;
+            }
+            baseline.put(id, value.clone());
+        }
+        for (int id : new int[] {0x58, 0x59}) {
+            byte[] value = mConfiguration.get(id);
+            if (value == null) continue;
+            if (!validValue(id, value)) {
+                mFailure = "snapshot_unavailable";
+                mFailedParameter = id;
+                mRecoveryRequired = true;
+                return false;
+            }
+            baseline.put(id, value.clone());
+        }
+        try {
+            // Persist and reload before deleting, so a failed commit cannot drop recovery.
+            mJournal.save(baseline);
+            mBaseline.clear();
+            mJournalLoaded = false;
+            if (!loadJournal()) return false;
+            mJournal.clear();
+        } catch (IOException e) {
+            mFailure = "journal_unavailable";
+            mRecoveryRequired = true;
+            return false;
+        }
+        clearRestoredSession();
+        return true;
+    }
+
     private void clearRestoredSession() {
         mFailure = null;
         mFailedParameter = -1;

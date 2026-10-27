@@ -205,6 +205,42 @@ public class NfcATagEmulationControllerTest {
     }
 
     @Test
+    public void unreadableJournalIsClearedAfterVerifiedResetBaseline() {
+        Map<Integer, byte[]> original = hardware.snapshot();
+        assertEquals(0, apply(uid));
+        journal.bytes[0] ^= 99;
+        controller = recreate();
+        hardware.values.clear();
+        hardware.values.putAll(original);
+        int writes = hardware.writes;
+        assertTrue(controller.recaptureBaselineAfterReset());
+        assertEquals(writes, hardware.writes);
+        assertFalse(controller.needsRecovery());
+        assertFalse(controller.isActive());
+        assertNull(journal.bytes);
+        assertEquals(-1, controller.ownerUid());
+        assertEquals(0, apply(uid));
+    }
+
+    @Test
+    public void unreadableJournalStaysBlockedWhenResetBaselineCannotBeRead() {
+        assertEquals(0, apply(uid));
+        byte[] corrupt = journal.bytes.clone();
+        corrupt[0] ^= 99;
+        journal.bytes = corrupt;
+        controller = recreate();
+        hardware.values.remove(0x31);
+        int writes = hardware.writes;
+        assertFalse(controller.recaptureBaselineAfterReset());
+        assertEquals(writes, hardware.writes);
+        assertTrue(controller.needsRecovery());
+        assertEquals("snapshot_unavailable", controller.failureReason());
+        assertArrayEquals(corrupt, journal.bytes);
+        assertEquals(2, controller.restore());
+        assertEquals(writes, hardware.writes);
+    }
+
+    @Test
     public void corruptAndUnknownJournalsNeverWriteController() {
         assertEquals(0, apply(uid));
         byte[] valid = journal.bytes.clone();
