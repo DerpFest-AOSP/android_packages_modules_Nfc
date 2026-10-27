@@ -141,17 +141,14 @@ tNFA_STATUS NfcDta::getConfigParamValues(std::vector<uint8_t> paramIds) {
     status = NFA_GetConfig(paramIds.size(), paramIds.data());
     if (status == NFA_STATUS_OK) {
       gNfaGetConfigEvent.wait();
-      // gCurrentConfigLen contains number of bytes without NCI header length.
-      // i.e., status(one byte) + config tag count(one byte) + NCI config
-      // Tag(one byte) + length(one byte) + value(bytes). So valid getConfig
-      // response length should be greater than 4.
-      if (gCurrentConfigLen > 4) {
-        // Config tlv length = gCurrentConfigLen - status byte - tag count byte
-        uint16_t len = gCurrentConfigLen - 2;
-        // First Config TLV starts from index 1 of gConfig
+      // gCurrentConfigLen is the TLV size with the CORE_GET_CONFIG_RSP status
+      // byte already removed. gConfig is [count][id][len][value]...
+      // A single parameter is at least count + id + len.
+      if (gCurrentConfigLen >= 3 && gCurrentConfigLen <= sizeof(gConfig)) {
         uint16_t index = 1;
-        LOG(DEBUG) << StringPrintf("%s: default_config len=%d", __func__, len);
-        while (index <= len) {
+        LOG(DEBUG) << StringPrintf("%s: default_config len=%d", __func__,
+                                   gCurrentConfigLen);
+        while (index < gCurrentConfigLen) {
           mDefaultTlv.push_back(gConfig[index++]);
         }
       } else {
