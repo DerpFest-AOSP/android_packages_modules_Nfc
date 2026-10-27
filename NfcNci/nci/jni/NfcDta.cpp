@@ -27,6 +27,7 @@ using android::base::StringPrintf;
 namespace android {
 extern SyncEvent gNfaSetConfigEvent;
 extern SyncEvent gNfaGetConfigEvent;
+extern bool nfc_nci_config_channel_usable();
 extern uint16_t gCurrentConfigLen;
 extern uint8_t gConfig[256];
 }  // namespace android
@@ -138,6 +139,11 @@ tNFA_STATUS NfcDta::getConfigParamValues(std::vector<uint8_t> paramIds) {
   tNFA_STATUS status = NFA_STATUS_OK;
   if (!paramIds.empty()) {
     SyncEventGuard guard(gNfaGetConfigEvent);
+    if (!nfc_nci_config_channel_usable()) {
+      LOG(ERROR) << StringPrintf(
+          "%s: skip getConfig; stale config response pending", __func__);
+      return NFA_STATUS_FAILED;
+    }
     status = NFA_GetConfig(paramIds.size(), paramIds.data());
     if (status == NFA_STATUS_OK) {
       gNfaGetConfigEvent.wait();
@@ -183,6 +189,11 @@ tNFA_STATUS NfcDta::setConfigParams(std::vector<uint8_t> configTlv) {
     LOG(DEBUG) << StringPrintf("%s: Param Id=%02X, Length=%02X", __func__,
                                paramId, len);
     SyncEventGuard guard(gNfaSetConfigEvent);
+    if (!nfc_nci_config_channel_usable()) {
+      LOG(ERROR) << StringPrintf(
+          "%s: skip setConfig; stale config response pending", __func__);
+      return NFA_STATUS_FAILED;
+    }
     status = NFA_SetConfig(paramId, len, &configTlv[index]);
     if (status == NFA_STATUS_OK) {
       gNfaSetConfigEvent.wait();

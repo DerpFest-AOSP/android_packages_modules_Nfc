@@ -150,6 +150,8 @@ static SyncEvent sNfaEnableDisablePollingEvent;  // event for
 SyncEvent gNfaSetConfigEvent;                    // event for Set_Config....
 static tNFA_STATUS sNciSetConfigStatus = NFA_STATUS_FAILED;
 static std::atomic_bool sNciConfigTimedOut{false};
+// Shared by identity, screen-state, polling, and DTA config transactions.
+bool nfc_nci_config_channel_usable();
 static tNFA_STATUS sRfDiscoveryStatus = NFA_STATUS_FAILED;
 SyncEvent gNfaGetConfigEvent;                    // event for Get_Config....
 SyncEvent gNfaVsCommand;                         // event for VS commands
@@ -2469,21 +2471,42 @@ static void nfcManager_doSetScreenState(JNIEnv* e, jobject o,
                              discovry_param);
 
   if (!sIsAlwaysPolling) {
+    bool configTimedOut = false;
     gMutexConfig.lock();
-    SyncEventGuard guard(gNfaSetConfigEvent);
-    status = NFA_SetConfig(NCI_PARAM_ID_CON_DISCOVERY_PARAM,
-                           NCI_PARAM_LEN_CON_DISCOVERY_PARAM, &discovry_param);
-    if (status == NFA_STATUS_OK) {
-      LOG(DEBUG) << StringPrintf("%s: wait for gNfaSetConfigEvent", __func__);
-      if (!gNfaSetConfigEvent.wait(5000)) {
-        LOG(ERROR) << StringPrintf("%s: wait for gNfaSetConfigEvent timeout",
-                                 __func__);
+    {
+      SyncEventGuard guard(gNfaSetConfigEvent);
+      if (!nfc_nci_config_channel_usable()) {
+        LOG(ERROR) << StringPrintf(
+            "%s: skip CON_DISCOVERY_PARAM; stale config response pending",
+            __func__);
+        status = NFA_STATUS_FAILED;
+      } else {
+        status = NFA_SetConfig(NCI_PARAM_ID_CON_DISCOVERY_PARAM,
+                               NCI_PARAM_LEN_CON_DISCOVERY_PARAM,
+                               &discovry_param);
+        if (status == NFA_STATUS_OK) {
+          LOG(DEBUG) << StringPrintf("%s: wait for gNfaSetConfigEvent",
+                                     __func__);
+          if (!gNfaSetConfigEvent.wait(5000)) {
+            LOG(ERROR) << StringPrintf(
+                "%s: wait for gNfaSetConfigEvent timeout", __func__);
+            // A late response must not complete a later config command.
+            sNciConfigTimedOut = true;
+            configTimedOut = true;
+            status = NFA_STATUS_TIMEOUT;
+          }
+        } else {
+          LOG(ERROR) << StringPrintf("%s: Failed to update CON_DISCOVER_PARAM",
+                                     __FUNCTION__);
+        }
       }
-      gMutexConfig.unlock();
-    } else {
-      LOG(ERROR) << StringPrintf("%s: Failed to update CON_DISCOVER_PARAM",
-                                 __FUNCTION__);
-      gMutexConfig.unlock();
+    }
+    gMutexConfig.unlock();
+    if (configTimedOut) {
+      nfaDeviceManagementCallback(NFA_DM_NFCC_TIMEOUT_EVT, nullptr);
+      return;
+    }
+    if (status != NFA_STATUS_OK) {
       return;
     }
   }
@@ -2955,6 +2978,11 @@ static void sendRawVsCmdCallback(uint8_t event, uint16_t param_len,
   gSendRawVsCmdEvent.notifyOne();
 }
 
+bool nfc_nci_config_channel_usable() {
+  return sIsNfaEnabled && !sIsDisabling && !sIsRecovering &&
+         !sNciConfigTimedOut.load();
+}
+
 static jboolean nfcManager_isNciConfigTimedOut(JNIEnv*, jobject) {
   return sNciConfigTimedOut.load() ? JNI_TRUE : JNI_FALSE;
 }
@@ -2986,7 +3014,7 @@ static jboolean nfcManager_setNciConfig(JNIEnv* e, jobject, jint param_id,
           : const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(bytes.get()));
   // Use the same lock order as screen-state and polling configuration.
   AutoMutex configLock(gMutexConfig);
-  if (!sIsNfaEnabled || sIsDisabling || sIsRecovering || sNciConfigTimedOut) {
+  if (!nfc_nci_config_channel_usable()) {
     return JNI_FALSE;
   }
   SyncEventGuard guard(gNfaSetConfigEvent);
@@ -3004,7 +3032,7 @@ static jboolean nfcManager_setNciConfig(JNIEnv* e, jobject, jint param_id,
 static jbyteArray nfcManager_getNciConfig(JNIEnv* e, jobject, jint param_id) {
   if (param_id < 0 || param_id > 255) return nullptr;
   AutoMutex configLock(gMutexConfig);
-  if (!sIsNfaEnabled || sIsDisabling || sIsRecovering || sNciConfigTimedOut) {
+  if (!nfc_nci_config_channel_usable()) {
     return nullptr;
   }
   SyncEventGuard guard(gNfaGetConfigEvent);
@@ -3331,21 +3359,31 @@ void startStopPolling(bool isStartPolling) {
 
   if (NFC_GetNCIVersion() >= NCI_VERSION_2_0) {
     gMutexConfig.lock();
-    SyncEventGuard guard(gNfaSetConfigEvent);
-    if (isStartPolling) {
-      discovry_param =
-          NCI_LISTEN_DH_NFCEE_ENABLE_MASK | NCI_POLLING_DH_ENABLE_MASK;
-    } else {
-      discovry_param =
-          NCI_LISTEN_DH_NFCEE_ENABLE_MASK | NCI_POLLING_DH_DISABLE_MASK;
-    }
-    status = NFA_SetConfig(NCI_PARAM_ID_CON_DISCOVERY_PARAM,
-                           NCI_PARAM_LEN_CON_DISCOVERY_PARAM, &discovry_param);
-    if (status == NFA_STATUS_OK) {
-      gNfaSetConfigEvent.wait();
-    } else {
-      LOG(ERROR) << StringPrintf("%s: Failed to update CON_DISCOVER_PARAM",
-                                 __FUNCTION__);
+    {
+      SyncEventGuard guard(gNfaSetConfigEvent);
+      if (!nfc_nci_config_channel_usable()) {
+        LOG(ERROR) << StringPrintf(
+            "%s: skip CON_DISCOVERY_PARAM; stale config response pending",
+            __func__);
+        status = NFA_STATUS_FAILED;
+      } else {
+        if (isStartPolling) {
+          discovry_param =
+              NCI_LISTEN_DH_NFCEE_ENABLE_MASK | NCI_POLLING_DH_ENABLE_MASK;
+        } else {
+          discovry_param =
+              NCI_LISTEN_DH_NFCEE_ENABLE_MASK | NCI_POLLING_DH_DISABLE_MASK;
+        }
+        status = NFA_SetConfig(NCI_PARAM_ID_CON_DISCOVERY_PARAM,
+                               NCI_PARAM_LEN_CON_DISCOVERY_PARAM,
+                               &discovry_param);
+        if (status == NFA_STATUS_OK) {
+          gNfaSetConfigEvent.wait();
+        } else {
+          LOG(ERROR) << StringPrintf("%s: Failed to update CON_DISCOVER_PARAM",
+                                     __FUNCTION__);
+        }
+      }
     }
     gMutexConfig.unlock();
   } else {
