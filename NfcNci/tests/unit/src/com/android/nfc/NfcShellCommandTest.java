@@ -26,6 +26,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -52,6 +53,7 @@ import org.mockito.quality.Strictness;
 
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
+import java.util.Map;
 
 @RunWith(AndroidJUnit4.class)
 public class NfcShellCommandTest {
@@ -100,6 +102,37 @@ public class NfcShellCommandTest {
         int status = mNfcShellCommand.onCommand("status");
         assertThat(status).isEqualTo(0);
         verify(mPrintWriter).println("Nfc is enabled");
+    }
+
+    @Test
+    public void testRecoveryRequiresRoot() {
+        when(ArrayUtils.indexOf(any(), eq("recover-type-a"))).thenReturn(-1);
+        org.junit.Assert.assertThrows(SecurityException.class,
+                () -> mNfcShellCommand.onCommand("recover-type-a"));
+        verify(mNfcService, never()).recoverNfcATagConfiguration(any());
+    }
+
+    @Test
+    public void testRecoveryParsesCompleteBaseline() {
+        mNfcShellCommand.init(mBinder, mFileDescriptorIn, mFileDescriptorOut,
+                mFileDescriptorErr, new String[] {"01", "04", "00", "20", "-", "11", "aB"}, 0);
+        assertThat(mNfcShellCommand.onCommand("recover-type-a")).isEqualTo(0);
+        org.mockito.ArgumentCaptor<Map<Integer, byte[]>> baseline =
+                org.mockito.ArgumentCaptor.forClass(Map.class);
+        verify(mNfcService).recoverNfcATagConfiguration(baseline.capture());
+        assertThat(baseline.getValue()).hasSize(7);
+        assertThat(baseline.getValue().get(0x33)).isEmpty();
+        assertThat(baseline.getValue().get(0x59)).isEqualTo(new byte[] {(byte) 0xab});
+    }
+
+    @Test
+    public void testInvalidRecoveryArgumentsNeverReachController() {
+        for (String uid : new String[] {"1", "zz", "010203", "0".repeat(32)}) {
+            mNfcShellCommand.init(mBinder, mFileDescriptorIn, mFileDescriptorOut,
+                    mFileDescriptorErr, new String[] {"01", "04", "00", "20", uid, "11", "-"}, 0);
+            assertThat(mNfcShellCommand.onCommand("recover-type-a")).isEqualTo(-1);
+        }
+        verify(mNfcService, never()).recoverNfcATagConfiguration(any());
     }
 
     @Test

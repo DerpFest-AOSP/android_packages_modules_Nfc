@@ -167,6 +167,48 @@ final class NfcATagEmulationController {
         return OK;
     }
 
+    /**
+     * Establishes an explicitly supplied baseline when the journal cannot be recovered.
+     * The privileged caller must stop discovery and supply trusted controller defaults,
+     * not values sampled from a controller that may still hold a custom identity.
+     */
+    int recover(Map<Integer, byte[]> baseline) {
+        LinkedHashMap<Integer, byte[]> known = copyRecoveryBaseline(baseline);
+        mFailure = null;
+        mFailedParameter = -1;
+        try {
+            // A process death during maintenance must retain a complete recovery target.
+            mJournal.save(known);
+        } catch (IOException e) {
+            mFailure = "journal_unavailable";
+            return FAILED;
+        }
+        mBaseline.clear();
+        mBaseline.putAll(known);
+        mJournalLoaded = true;
+        mRecoveryRequired = true;
+        mActive = null;
+        mOwnerUid = -1;
+        mGeneration++;
+        // restore() clears the journal only after every write has passed readback.
+        return restore();
+    }
+
+    static LinkedHashMap<Integer, byte[]> copyRecoveryBaseline(Map<Integer, byte[]> baseline) {
+        if (baseline == null || baseline.size() != 7) {
+            throw new IllegalArgumentException("Recovery requires all seven Type-A parameters");
+        }
+        LinkedHashMap<Integer, byte[]> known = new LinkedHashMap<>();
+        for (int id : new int[] {CONFIG_CONTROL, 0x30, 0x31, 0x32, 0x33, 0x58, 0x59}) {
+            byte[] value = baseline.get(id);
+            if (!validValue(id, value)) {
+                throw new IllegalArgumentException("Invalid Type-A recovery parameter " + id);
+            }
+            known.put(id, value.clone());
+        }
+        return known;
+    }
+
     private void clearRestoredSession() {
         mFailure = null;
         mFailedParameter = -1;

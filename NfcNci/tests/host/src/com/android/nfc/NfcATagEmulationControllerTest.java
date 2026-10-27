@@ -222,6 +222,133 @@ public class NfcATagEmulationControllerTest {
         }
     }
 
+    private Map<Integer, byte[]> corruptActiveJournal() {
+        Map<Integer, byte[]> original = hardware.snapshot();
+        assertEquals(0, apply(uid));
+        journal.bytes[0] ^= 99;
+        controller = recreate();
+        assertEquals(2, controller.restore());
+        return original;
+    }
+
+    @Test
+    public void explicitRecoveryVerifiesEveryParameterBeforeClearingCorruptJournal() {
+        Map<Integer, byte[]> original = corruptActiveJournal();
+        int writes = hardware.writes;
+        int reads = hardware.reads;
+        journal.beforeClear = () -> {
+            assertEquals(7, hardware.writes - writes);
+            assertEquals(7, hardware.reads - reads);
+            original.forEach((id, value) -> assertArrayEquals(value, hardware.values.get(id)));
+        };
+        hardware.beforeWrite = () -> {
+            try {
+                assertEquals(7, new NfcATagRecoveryJournal(journal).load().size());
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
+        };
+        assertEquals(0, controller.recover(original));
+        assertNull(journal.bytes);
+        assertFalse(controller.needsRecovery());
+        assertFalse(controller.isActive());
+        assertEquals(-1, controller.ownerUid());
+    }
+
+    @Test
+    public void explicitRecoveryRejectsIncompleteOrInvalidBaselinesBeforeWrites() {
+        Map<Integer, byte[]> original = corruptActiveJournal();
+        byte[] corrupt = journal.bytes.clone();
+        int writes = hardware.writes;
+        for (int id : original.keySet()) {
+            Map<Integer, byte[]> incomplete = new HashMap<>(original);
+            incomplete.remove(id);
+            assertThrows(IllegalArgumentException.class, () -> controller.recover(incomplete));
+        }
+        Map<Integer, byte[]> invalid = new HashMap<>(original);
+        invalid.put(0x33, new byte[3]);
+        assertThrows(IllegalArgumentException.class, () -> controller.recover(invalid));
+        invalid.put(0x33, new byte[0]);
+        invalid.put(0x58, new byte[0]);
+        assertThrows(IllegalArgumentException.class, () -> controller.recover(invalid));
+        invalid.put(0x58, new byte[] {1});
+        invalid.put(0x59, new byte[16]);
+        assertThrows(IllegalArgumentException.class, () -> controller.recover(invalid));
+        invalid.put(0x59, new byte[0]);
+        invalid.remove(0x85);
+        invalid.put(0xff, new byte[] {1});
+        assertThrows(IllegalArgumentException.class, () -> controller.recover(invalid));
+        assertThrows(IllegalArgumentException.class, () -> controller.recover(null));
+        assertEquals(writes, hardware.writes);
+        assertArrayEquals(corrupt, journal.bytes);
+    }
+
+    @Test
+    public void explicitRecoveryCannotWriteWhenReplacementJournalIsNotDurable() {
+        Map<Integer, byte[]> original = corruptActiveJournal();
+        byte[] corrupt = journal.bytes.clone();
+        journal.failWrite = true;
+        int writes = hardware.writes;
+        assertEquals(2, controller.recover(original));
+        assertEquals(writes, hardware.writes);
+        assertArrayEquals(corrupt, journal.bytes);
+        assertTrue(controller.needsRecovery());
+        assertEquals("journal_unavailable", controller.failureReason());
+    }
+
+    @Test
+    public void explicitRecoveryRejectionKeepsDurableTargetAcrossRestart() {
+        Map<Integer, byte[]> original = corruptActiveJournal();
+        hardware.rejectNextId = 0x31;
+        int writes = hardware.writes;
+        assertEquals(2, controller.recover(original));
+        assertEquals(7, hardware.writes - writes);
+        assertNotNull(journal.bytes);
+        assertTrue(controller.needsRecovery());
+        assertEquals(0x31, controller.failedParameter());
+        controller = recreate();
+        assertEquals(0, controller.restore());
+        assertNull(journal.bytes);
+        original.forEach((id, value) -> assertArrayEquals(value, hardware.values.get(id)));
+    }
+
+    @Test
+    public void explicitRecoveryRejectsAcknowledgedWritesWithoutReadback() {
+        Map<Integer, byte[]> original = corruptActiveJournal();
+        hardware.ignoreNextId = 0x33;
+        assertEquals(2, controller.recover(original));
+        assertTrue(controller.needsRecovery());
+        assertNotNull(journal.bytes);
+        assertEquals("readback_mismatch", controller.failureReason());
+        assertEquals(0, controller.restore());
+    }
+
+    @Test
+    public void explicitRecoveryDriverExceptionKeepsTargetForRestart() {
+        Map<Integer, byte[]> original = corruptActiveJournal();
+        hardware.throwNextId = 0x33;
+        assertThrows(IllegalStateException.class, () -> controller.recover(original));
+        assertTrue(controller.needsRecovery());
+        assertFalse(controller.isActive());
+        assertNotNull(journal.bytes);
+        controller = recreate();
+        assertEquals(0, controller.restore());
+        original.forEach((id, value) -> assertArrayEquals(value, hardware.values.get(id)));
+    }
+
+    @Test
+    public void explicitRecoveryRetriesJournalDeletionWithoutResamplingController() {
+        Map<Integer, byte[]> original = corruptActiveJournal();
+        journal.failClear = true;
+        assertEquals(2, controller.recover(original));
+        assertTrue(controller.needsRecovery());
+        assertEquals("journal_unavailable", controller.failureReason());
+        journal.failClear = false;
+        assertEquals(0, controller.restore());
+        assertNull(journal.bytes);
+        original.forEach((id, value) -> assertArrayEquals(value, hardware.values.get(id)));
+    }
+
     @Test
     public void restoreFailureRetainsJournalAcrossAnotherProcessRestart() {
         assertEquals(0, apply(uid));
@@ -281,6 +408,7 @@ public class NfcATagEmulationControllerTest {
         byte[] bytes;
         boolean failWrite;
         boolean failClear;
+        Runnable beforeClear;
 
         public byte[] read() {
             return bytes == null ? null : bytes.clone();
@@ -292,6 +420,7 @@ public class NfcATagEmulationControllerTest {
         }
 
         public void clear() throws IOException {
+            if (beforeClear != null) beforeClear.run();
             if (failClear) throw new IOException("Test deletion unavailable");
             bytes = null;
         }
@@ -303,6 +432,7 @@ public class NfcATagEmulationControllerTest {
         int throwNextId = -1;
         int ignoreNextId = -1;
         int writes;
+        int reads;
         Runnable beforeWrite;
         boolean rejectPermanently;
 
@@ -317,6 +447,7 @@ public class NfcATagEmulationControllerTest {
         }
 
         public byte[] get(int id) {
+            reads++;
             byte[] value = values.get(id);
             return value == null ? null : value.clone();
         }

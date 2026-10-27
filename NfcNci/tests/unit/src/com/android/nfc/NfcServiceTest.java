@@ -1793,6 +1793,15 @@ public final class NfcServiceTest {
     }
 
     @Test
+    public void testRecoveryRejectsNonRootCallerBeforeControllerWrites() {
+        clearInvocations(mDeviceHost);
+        org.junit.Assert.assertThrows(SecurityException.class,
+                () -> mNfcService.recoverNfcATagConfiguration(Collections.emptyMap()));
+        verify(mDeviceHost, never()).disableDiscovery();
+        verify(mDeviceHost, never()).setNciConfig(anyInt(), any(), anyInt(), anyBoolean());
+    }
+
+    @Test
     public void testCustomIdentityRejectsOwnerWhoBackgroundsBeforeRegistration() {
         mNfcService.mState.set(NfcAdapter.STATE_ON);
         int uid = Binder.getCallingUid();

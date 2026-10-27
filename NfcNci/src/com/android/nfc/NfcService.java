@@ -2568,6 +2568,51 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
         }
     }
 
+    /** Root-only maintenance; a controller reset alone cannot replace a lost baseline. */
+    int recoverNfcATagConfiguration(Map<Integer, byte[]> baseline) {
+        if (Binder.getCallingUid() != Process.ROOT_UID) {
+            throw new SecurityException("Type-A baseline recovery requires root");
+        }
+        Map<Integer, byte[]> known = NfcATagEmulationController.copyRecoveryBaseline(baseline);
+        synchronized (this) {
+            if (!isNfcEnabled()) {
+                return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_NFC_NOT_ENABLED;
+            }
+            if (mNfcAUserSwitchPending || mReaderModeParams != null || isTagPresent()
+                    || !mNfcATagEmulationController.needsRecovery()) {
+                mNfcAOperationFailure = "busy";
+                return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL;
+            }
+            // Seven bounded write/read pairs may take longer than a routing update.
+            WatchDogThread watchdog = new WatchDogThread("recoverNfcATagConfiguration",
+                    ROUTING_WATCHDOG_MS * 6);
+            watchdog.start();
+            try {
+                mNfcAOperationFailure = null;
+                mDeviceHost.disableDiscovery();
+                if (mDeviceHost.isDiscoveryEnabled()) {
+                    mNfcADiscoveryRecoveryRequired = true;
+                    mNfcAOperationFailure = "discovery_failed";
+                    return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL;
+                }
+                int result = mNfcATagEmulationController.recover(known);
+                if (result != NfcATagEmulationController.OK) return result;
+                mNfcADiscoveryRecoveryRequired = false;
+                applyRouting(true);
+                if (computeDiscoveryParameters(mScreenState).shouldEnableDiscovery()
+                        != mDeviceHost.isDiscoveryEnabled()) {
+                    mNfcADiscoveryRecoveryRequired = true;
+                    mNfcAOperationFailure = "discovery_failed";
+                    mDeviceHost.disableDiscovery();
+                    return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL;
+                }
+                return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_OK;
+            } finally {
+                watchdog.cancel();
+            }
+        }
+    }
+
     public void enableNfc() {
         saveNfcOnSetting(true);
 

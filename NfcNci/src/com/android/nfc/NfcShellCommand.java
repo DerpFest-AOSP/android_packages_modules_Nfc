@@ -31,6 +31,8 @@ import com.android.modules.utils.BasicShellCommandHandler;
 
 import java.io.PrintWriter;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * Interprets and executes 'adb shell cmd nfc [args]'.
@@ -105,6 +107,20 @@ public class NfcShellCommand extends BasicShellCommandHandler {
         final PrintWriter pw = getOutPrintWriter();
         try {
             switch (cmd) {
+                case "recover-type-a": {
+                    Map<Integer, byte[]> baseline = new LinkedHashMap<>();
+                    for (int id : new int[] {0x85, 0x30, 0x31, 0x32, 0x33, 0x58, 0x59}) {
+                        baseline.put(id, getRecoveryValue());
+                    }
+                    if (getNextArg() != null) {
+                        throw new IllegalArgumentException("Unexpected recovery argument");
+                    }
+                    int result = mNfcService.recoverNfcATagConfiguration(
+                            NfcATagEmulationController.copyRecoveryBaseline(baseline));
+                    pw.println(result == 0 ? "Type-A baseline restored"
+                            : "Type-A recovery failed; inspect NFC service state");
+                    return result == 0 ? 0 : -1;
+                }
                 case "status":
                     printStatus(pw);
                     return 0;
@@ -217,6 +233,25 @@ public class NfcShellCommand extends BasicShellCommandHandler {
         }
     }
 
+    private byte[] getRecoveryValue() {
+        String hex = getNextArg();
+        if (hex == null) throw new IllegalArgumentException("Missing recovery parameter");
+        if (hex.equals("-")) return new byte[0];
+        if (hex.length() > 30 || (hex.length() & 1) != 0) {
+            throw new IllegalArgumentException("Invalid recovery parameter length");
+        }
+        byte[] value = new byte[hex.length() / 2];
+        for (int i = 0; i < value.length; i++) {
+            int high = Character.digit(hex.charAt(2 * i), 16);
+            int low = Character.digit(hex.charAt(2 * i + 1), 16);
+            if (high < 0 || low < 0) {
+                throw new IllegalArgumentException("Invalid hexadecimal recovery parameter");
+            }
+            value[i] = (byte) ((high << 4) | low);
+        }
+        return value;
+    }
+
     private void configureDta(boolean enable) {
         final PrintWriter pw = getOutPrintWriter();
         pw.println("  configure-dta");
@@ -268,6 +303,10 @@ public class NfcShellCommand extends BasicShellCommandHandler {
     }
 
     private void onHelpPrivileged(PrintWriter pw) {
+        pw.println("  recover-type-a <85> <30> <31> <32> <33> <58> <59>");
+        pw.println("    Restore all seven Type-A parameters from trusted controller defaults.");
+        pw.println("    Values are hex bytes; use '-' for an empty NFCID1 or historical bytes.");
+        pw.println("    Never substitute a live controller snapshot for a lost baseline.");
         pw.println("  set-observe-mode enable|disable");
         pw.println("    Enable or disable observe mode.");
         pw.println("  set-reader-mode enable-polling|disable-polling");
