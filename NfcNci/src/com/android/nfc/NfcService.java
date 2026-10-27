@@ -501,6 +501,8 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
     private String mNfcAOperationFailure;
     private volatile boolean mNfcAUserSwitchPending;
     private volatile boolean mNfcADiscoveryRecoveryRequired;
+    // Routing was left unchanged by policy. Discovery may resume on a later attempt.
+    private boolean mNfcARoutingDeferred;
     private GesturePollFrameObserver mGesturePollFrameObserver;
     private SharedPreferences mPrefs;
     private SharedPreferences.Editor mPrefsEditor;
@@ -2109,6 +2111,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
             }
             synchronized (NfcService.this) {
                 mNfcADiscoveryRecoveryRequired = false;
+                mNfcARoutingDeferred = false;
                 mNfcAOperationFailure = null;
                 if (mNfcATagEmulationController.isActive()
                         || mNfcATagEmulationController.needsRecovery()) {
@@ -2555,13 +2558,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
             mNfcATagEmulationController.restore();
             if (!mNfcATagEmulationController.needsRecovery()) {
                 mNfcADiscoveryRecoveryRequired = false;
-                applyRouting(true);
-                if (isNfcEnabled() && computeDiscoveryParameters(mScreenState)
-                        .shouldEnableDiscovery() != mDeviceHost.isDiscoveryEnabled()) {
-                    mNfcADiscoveryRecoveryRequired = true;
-                    mNfcAOperationFailure = "discovery_failed";
-                    mDeviceHost.disableDiscovery();
-                }
+                acceptNfcARoutingResult(applyRouting(true));
             }
         } finally {
             watchdog.cancel();
@@ -4212,15 +4209,13 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                             : mNfcATagEmulationController.restore();
                     if (!mNfcATagEmulationController.needsRecovery()) {
                         mNfcADiscoveryRecoveryRequired = false;
-                        applyRouting(true);
-                        boolean expectedDiscovery = computeDiscoveryParameters(mScreenState)
-                                .shouldEnableDiscovery();
-                        if (expectedDiscovery != mDeviceHost.isDiscoveryEnabled()) {
-                            // No identity may be advertised after a failed RF restart.
-                            mNfcAOperationFailure = "discovery_failed";
-                            mNfcADiscoveryRecoveryRequired = true;
+                        int routing = applyRouting(true);
+                        if (routing != ROUTING_APPLIED && routing != ROUTING_DEFERRED) {
+                            // A failed RF restart must not keep advertising the new identity.
+                            // A policy deferral is not a failure and must not stick recovery.
                             mDeviceHost.disableDiscovery();
                             mNfcATagEmulationController.restore();
+                            acceptNfcARoutingResult(routing);
                             return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL;
                         }
                     }
@@ -4279,7 +4274,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                 boolean active = isNfcEnabled() && mNfcATagEmulationController.isActive();
                 boolean recovery = mNfcATagEmulationController.needsRecovery()
                         || mNfcADiscoveryRecoveryRequired
-                        || (active && !mDeviceHost.isDiscoveryEnabled());
+                        || (active && !mNfcARoutingDeferred && !mDeviceHost.isDiscoveryEnabled());
                 state.putBoolean("reading", mReaderModeParams != null);
                 state.putString("failure_reason", mDeviceHost.isNciConfigTimedOut() ? "timeout"
                         : mNfcAOperationFailure != null ? mNfcAOperationFailure
@@ -5248,34 +5243,46 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
     };
 
 
+    /** Routing ran and discovery matches the computed parameters. */
+    static final int ROUTING_APPLIED = 0;
+    /** Routing was left unchanged until a later attempt. Discovery is not failed. */
+    static final int ROUTING_DEFERRED = 1;
+    /** Discovery was started or stopped and the controller did not reach that state. */
+    static final int ROUTING_FAILED = 2;
+    /** Discovery stays off because Type-A controller recovery is unfinished. */
+    static final int ROUTING_BLOCKED = 3;
+
     /**
-     * Read mScreenState and apply NFC-C polling and NFC-EE routing
+     * Read mScreenState and apply NFC-C polling and NFC-EE routing.
+     *
+     * @return {@link #ROUTING_APPLIED}, {@link #ROUTING_DEFERRED}, {@link #ROUTING_FAILED},
+     * or {@link #ROUTING_BLOCKED}
      */
-    void applyRouting(boolean force) {
+    int applyRouting(boolean force) {
         if (DBG) {
             Log.d(TAG, "applyRouting");
         }
         synchronized (this) {
             if (!isNfcEnabled()) {
                 Log.d(TAG, "applyRouting: skip because nfc is not enabled");
-                return;
+                return finishNfcARouting(ROUTING_DEFERRED);
             }
             if (mNfcOemExtensionCallback != null
                    && receiveOemCallbackResult(ACTION_ON_APPLY_ROUTING)) {
                 Log.d(TAG, "applyRouting: skip due to oem callback");
-                return;
+                return finishNfcARouting(ROUTING_DEFERRED);
             }
             if (mNfcAUserSwitchPending || mNfcADiscoveryRecoveryRequired
                     || mNfcATagEmulationController.needsRecovery()) {
                 mDeviceHost.disableDiscovery();
-                return;
+                return finishNfcARouting(ROUTING_BLOCKED);
             }
             refreshTagDispatcherInProvisionMode();
             boolean privilegedCaller = NfcInjector.isPrivileged(Binder.getCallingUid())
                     || NfcPermissions.checkAdminPermissions(mContext);
             if (mPollingPaused && !privilegedCaller) {
                 Log.d(TAG, "applyRouting: Not updating discovery parameters, polling paused");
-                return;
+                return finishNfcARouting(ROUTING_DEFERRED);
             }
             // Special case: if we're transitioning to unlocked state while
             // still talking to a tag, postpone re-configuration.
@@ -5283,7 +5290,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                 Log.d(TAG, "applyRouting: Not updating discovery parameters, tag connected");
                 mHandler.sendMessageDelayed(mHandler.obtainMessage(MSG_RESUME_POLLING),
                         APPLY_ROUTING_RETRY_TIMEOUT_MS);
-                return;
+                return finishNfcARouting(ROUTING_DEFERRED);
             }
 
             synchronized (mRoutingWatchDogLock) {
@@ -5305,13 +5312,38 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                     mNfcADiagnosticTrace.record(NfcADiagnosticTrace.Event.DISCOVERY,
                             newParams.shouldEnableHostRouting() ? 1 : 0,
                             mDeviceHost.isDiscoveryEnabled() ? 1 : 0);
+                    if (newParams.shouldEnableDiscovery() != mDeviceHost.isDiscoveryEnabled()) {
+                        Log.w(TAG, "applyRouting: discovery state did not match the request");
+                        return finishNfcARouting(ROUTING_FAILED);
+                    }
                 } else {
                     Log.d(TAG, "applyRouting: Discovery configuration equal, not updating");
                 }
+                return finishNfcARouting(ROUTING_APPLIED);
             } finally {
                 cancelRoutingWatchDog();
             }
         }
+    }
+
+    private int finishNfcARouting(int result) {
+        mNfcARoutingDeferred = result == ROUTING_DEFERRED;
+        return result;
+    }
+
+    /**
+     * A deferred routing update can be retried. A failed or blocked update keeps discovery
+     * suppressed only while the controller still needs recovery or RF is still on.
+     */
+    private void acceptNfcARoutingResult(int routing) {
+        if (routing == ROUTING_APPLIED || routing == ROUTING_DEFERRED) return;
+        mNfcAOperationFailure = "discovery_failed";
+        mNfcARoutingDeferred = false;
+        if (mDeviceHost.isDiscoveryEnabled()) {
+            mDeviceHost.disableDiscovery();
+        }
+        mNfcADiscoveryRecoveryRequired = mNfcATagEmulationController.needsRecovery()
+                || mDeviceHost.isDiscoveryEnabled();
     }
 
     private NfcDiscoveryParameters computeDiscoveryParameters(int screenState) {
@@ -6931,7 +6963,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                                 }
                             }
                             mNfcAUserSwitchPending = false;
-                            applyRouting(true);
+                            acceptNfcARoutingResult(applyRouting(true));
                         } finally {
                             watchdog.cancel();
                         }
@@ -7278,6 +7310,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
             pw.println("NfcAEmulation: active=" + mNfcATagEmulationController.isActive()
                     + " recovery_required=" + (mNfcATagEmulationController.needsRecovery()
                             || mNfcADiscoveryRecoveryRequired)
+                    + " routing_deferred=" + mNfcARoutingDeferred
                     + " user_switch_pending=" + mNfcAUserSwitchPending
                     + " rf_discovery=" + mDeviceHost.isDiscoveryEnabled()
                     + " generation=" + mNfcATagEmulationController.generation()

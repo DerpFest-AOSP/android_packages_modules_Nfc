@@ -2918,6 +2918,74 @@ public final class NfcServiceTest {
     }
 
     @Test
+    public void testApplyRouting_oemDeferralIsNotADiscoveryFailure() throws Exception {
+        mNfcService.mState.set(NfcAdapter.STATE_ON);
+        when(mForegroundUtils.isInForeground(anyInt())).thenReturn(true);
+        when(mForegroundUtils.registerUidToBackgroundCallback(any(), anyInt())).thenReturn(true);
+        stubNfcAConfigRoundTrip();
+        when(mDeviceHost.isDiscoveryEnabled()).thenReturn(false);
+        INfcOemExtensionCallback callback = mock(INfcOemExtensionCallback.class);
+        when(callback.asBinder()).thenReturn(mock(IBinder.class));
+        int[] skips = new int[] {1};
+        doAnswer(invocation -> {
+            ResultReceiver receiver = invocation.getArgument(0);
+            receiver.send(skips[0] > 0 ? 1 : 0, null);
+            skips[0]--;
+            return null;
+        }).when(callback).onApplyRouting(any(ResultReceiver.class));
+        mNfcService.mNfcAdapter.registerOemExtensionCallback(callback);
+
+        int result = mNfcService.mNfcAdapter.emulateNfcATag(true, (byte) 4, (byte) 0,
+                (byte) 8, new byte[] {1, 2, 3, 4}, (byte) 0, null);
+
+        assertEquals(NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_OK, result);
+        Bundle state = mNfcService.mNfcAdapter.getNfcATagEmulationState();
+        assertTrue(state.getBoolean("active"));
+        assertFalse(state.getBoolean("recovery_required"));
+        verify(mDeviceHost, never()).enableDiscovery(any(), anyBoolean());
+
+        when(mDeviceHost.isDiscoveryEnabled()).thenReturn(true);
+        assertEquals(NfcService.ROUTING_APPLIED, mNfcService.applyRouting(true));
+        verify(mDeviceHost).enableDiscovery(any(), anyBoolean());
+    }
+
+    @Test
+    public void testApplyRouting_failedDiscoveryDoesNotStickAfterBaselineRestore() throws Exception {
+        mNfcService.mState.set(NfcAdapter.STATE_ON);
+        when(mForegroundUtils.isInForeground(anyInt())).thenReturn(true);
+        when(mForegroundUtils.registerUidToBackgroundCallback(any(), anyInt())).thenReturn(true);
+        stubNfcAConfigRoundTrip();
+        when(mDeviceHost.isDiscoveryEnabled()).thenReturn(false);
+
+        int result = mNfcService.mNfcAdapter.emulateNfcATag(true, (byte) 4, (byte) 0,
+                (byte) 8, new byte[] {1, 2, 3, 4}, (byte) 0, null);
+
+        assertEquals(NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL, result);
+        Bundle state = mNfcService.mNfcAdapter.getNfcATagEmulationState();
+        assertFalse(state.getBoolean("active"));
+        assertFalse(state.getBoolean("recovery_required"));
+
+        when(mDeviceHost.isDiscoveryEnabled()).thenReturn(true);
+        assertEquals(NfcService.ROUTING_APPLIED, mNfcService.applyRouting(true));
+        verify(mDeviceHost, times(2)).enableDiscovery(any(), anyBoolean());
+    }
+
+    private void stubNfcAConfigRoundTrip() {
+        Map<Integer, byte[]> configs = new HashMap<>();
+        when(mDeviceHost.getNciConfig(anyInt())).thenAnswer(invocation -> {
+            byte[] value = configs.get((Integer) invocation.getArgument(0));
+            if (value != null) return value.clone();
+            return ((Integer) invocation.getArgument(0)) == 0x33 ? new byte[0] : new byte[] {1};
+        });
+        when(mDeviceHost.setNciConfig(anyInt(), any(), anyInt(), anyBoolean()))
+                .thenAnswer(invocation -> {
+                    configs.put((Integer) invocation.getArgument(0),
+                            ((byte[]) invocation.getArgument(1)).clone());
+                    return true;
+                });
+    }
+
+    @Test
     public void testDeviceSupportsNfcSecure_HceAndSecureNfcCapable_ReturnsTrue() {
         // Arrange: HCE is capable and secure NFC is configured as capable
         when(mPackageManager.hasSystemFeature(PackageManager.FEATURE_NFC_HOST_CARD_EMULATION))
