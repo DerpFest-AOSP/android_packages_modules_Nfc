@@ -1086,6 +1086,9 @@ public final class NfcOemExtension {
      * If you enable any type other than type 4, then enabling this functionality disables all the
      * regularly registered CE services via {@link android.nfc.cardemulation.HostApduService} and
      * {@link android.nfc.cardemulation.OffHostApduService} services on the device.
+     * The calling application must be in the foreground when enabling a custom identity.
+     * The NFC service restores the regular configuration when the owner leaves the foreground
+     * or its process exits. System-owned sessions are exempt from the foreground requirement.
      *
      * @param enable whether to enable or disable the card emulation with custom parameters.
      * @param bitFrameSdd value is defined in "NFCForum-TS-NCI section 6.1.9" and to be sent

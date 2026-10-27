@@ -17,6 +17,8 @@
 package com.android.nfc;
 
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import android.app.ActivityManager;
@@ -136,5 +138,36 @@ public class ForegroundUtilsTest {
         Assert.assertNotNull(uids);
         int uid = uids.get(0);
         Assert.assertEquals(0, uid);
+    }
+
+    @Test
+    public void testProcessDeathNotifiesRegisteredOwnerExactlyOnce() {
+        ForegroundUtils.Callback callback = mock(ForegroundUtils.Callback.class);
+        mForegroundUtils.onUidImportance(42,
+                ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND);
+        Assert.assertTrue(mForegroundUtils.registerUidToBackgroundCallback(callback, 42));
+
+        mForegroundUtils.onUidImportance(42,
+                ActivityManager.RunningAppProcessInfo.IMPORTANCE_GONE);
+        mForegroundUtils.onUidImportance(42,
+                ActivityManager.RunningAppProcessInfo.IMPORTANCE_GONE);
+
+        verify(callback, times(1)).onUidToBackground(42);
+        Assert.assertNull(mForegroundUtils.getBackgroundCallbacks().get(42));
+        Assert.assertTrue(mForegroundUtils.getForegroundUids().isEmpty());
+    }
+
+    @Test
+    public void testBackgroundNotifiesOwnerRegisteredBeforeFirstImportanceEvent() {
+        ForegroundUtils.Callback callback = mock(ForegroundUtils.Callback.class);
+        when(mActivityManager.getUidImportance(42)).thenReturn(
+                ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND);
+        Assert.assertTrue(mForegroundUtils.registerUidToBackgroundCallback(callback, 42));
+
+        mForegroundUtils.onUidImportance(42,
+                ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE);
+
+        verify(callback).onUidToBackground(42);
+        Assert.assertNull(mForegroundUtils.getBackgroundCallbacks().get(42));
     }
 }

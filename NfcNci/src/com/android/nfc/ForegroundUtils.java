@@ -157,17 +157,15 @@ public class ForegroundUtils implements ActivityManager.OnUidImportanceListener 
         boolean uidToBackground = false;
         synchronized (mLock) {
             if (importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_GONE) {
+                uidToBackground = mBackgroundCallbacks.get(uid) != null;
                 mForegroundUids.delete(uid);
-                mBackgroundCallbacks.remove(uid);
                 if (VDBG) {
                     Log.d(TAG, "onUidImportance: UID: " + Integer.toString(uid) + " deleted");
                 }
-                return;
-            }
-            if (importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND) {
+            } else if (importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND) {
                 mForegroundUids.put(uid, true);
             } else {
-                if (mForegroundUids.get(uid)) {
+                if (mForegroundUids.get(uid) || mBackgroundCallbacks.get(uid) != null) {
                     uidToBackground = true;
                     mForegroundUids.put(uid, false);
                 }

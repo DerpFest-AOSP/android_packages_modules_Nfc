@@ -184,6 +184,7 @@ public final class NfcServiceTest {
     @Mock KeyguardManager mKeyguardManager;
     @Mock UserManager mUserManager;
     @Mock ActivityManager mActivityManager;
+    @Mock ForegroundUtils mForegroundUtils;
     @Mock NfcServiceManager.ServiceRegisterer mNfcManagerRegisterer;
     @Mock NfcDiagnostics mNfcDiagnostics;
     @Mock DeviceConfigFacade mDeviceConfigFacade;
@@ -254,6 +255,7 @@ public final class NfcServiceTest {
         when(mNfcInjector.getMainLooper()).thenReturn(mLooper.getLooper());
         when(mNfcInjector.getNfcEventLog()).thenReturn(mNfcEventLog);
         when(mNfcInjector.makeDeviceHost(any())).thenReturn(mDeviceHost);
+        when(mNfcInjector.getForegroundUtils()).thenReturn(mForegroundUtils);
         when(mNfcInjector.makeNfcATagRecoveryJournal())
                 .thenAnswer(
                         invocation ->
@@ -1774,6 +1776,37 @@ public final class NfcServiceTest {
         verify(binder).unlinkToDeath(any(), anyInt());
         verify(mDeviceHost).resetDiscoveryTech();
         Assert.assertNull(mNfcService.mDiscoveryTechParams);
+    }
+
+    @Test
+    public void testCustomIdentityRejectsBackgroundOwnerBeforeControllerWrites() {
+        mNfcService.mState.set(NfcAdapter.STATE_ON);
+        when(mForegroundUtils.isInForeground(Binder.getCallingUid())).thenReturn(false);
+        clearInvocations(mDeviceHost);
+
+        int result = mNfcService.mNfcAdapter.emulateNfcATag(true, (byte) 4, (byte) 0,
+                (byte) 8, new byte[] {1, 2, 3, 4}, (byte) 0, null);
+
+        assertEquals(NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL, result);
+        verify(mDeviceHost, never()).disableDiscovery();
+        verify(mDeviceHost, never()).setNciConfig(anyInt(), any(), anyInt(), anyBoolean());
+    }
+
+    @Test
+    public void testCustomIdentityRejectsOwnerWhoBackgroundsBeforeRegistration() {
+        mNfcService.mState.set(NfcAdapter.STATE_ON);
+        int uid = Binder.getCallingUid();
+        when(mForegroundUtils.isInForeground(uid)).thenReturn(true);
+        when(mForegroundUtils.registerUidToBackgroundCallback(mNfcService, uid)).thenReturn(false);
+        clearInvocations(mDeviceHost);
+
+        int result = mNfcService.mNfcAdapter.emulateNfcATag(true, (byte) 4, (byte) 0,
+                (byte) 8, new byte[] {1, 2, 3, 4}, (byte) 0, null);
+
+        assertEquals(NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL, result);
+        verify(mForegroundUtils).registerUidToBackgroundCallback(mNfcService, uid);
+        verify(mDeviceHost, never()).disableDiscovery();
+        verify(mDeviceHost, never()).setNciConfig(anyInt(), any(), anyInt(), anyBoolean());
     }
 
     @Test

@@ -497,6 +497,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
     private final NfcADiagnosticTrace mNfcADiagnosticTrace = new NfcADiagnosticTrace(
             System::currentTimeMillis, SystemClock::elapsedRealtime);
     private final NfcATagFeedback mNfcATagFeedback = new NfcATagFeedback();
+    private int mNfcAForegroundUid = -1;
     private String mNfcAOperationFailure;
     private volatile boolean mNfcAUserSwitchPending;
     private volatile boolean mNfcADiscoveryRecoveryRequired;
@@ -2509,6 +2510,17 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
     public void onUidToBackground(int uid) {
         Log.i(TAG, "onUidToBackground: Uid " + uid);
         synchronized (NfcService.this) {
+            boolean watchedOwner = mNfcAForegroundUid == uid;
+            if (watchedOwner) mNfcAForegroundUid = -1;
+            if (mNfcATagEmulationController.ownerUid() == uid
+                    || (watchedOwner && mNfcATagEmulationController.needsRecovery())) {
+                // A queued callback must not tear down a newly foreground session.
+                if (mForegroundUtils.registerUidToBackgroundCallback(this, uid)) {
+                    mNfcAForegroundUid = uid;
+                } else {
+                    restoreNfcATagForBackground();
+                }
+            }
             if (mReaderModeParams != null && mReaderModeParams.uid == uid) {
                 mReaderModeParams.binder.unlinkToDeath(mReaderModeDeathRecipient, 0);
                 resetReaderModeParams();
@@ -2525,6 +2537,34 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                   applyRouting(true);
                 }
             }
+        }
+    }
+
+    private void restoreNfcATagForBackground() {
+        WatchDogThread watchdog = new WatchDogThread("restoreNfcATagForBackground",
+                ROUTING_WATCHDOG_MS);
+        watchdog.start();
+        try {
+            mNfcAOperationFailure = null;
+            mDeviceHost.disableDiscovery();
+            if (mDeviceHost.isDiscoveryEnabled()) {
+                mNfcADiscoveryRecoveryRequired = true;
+                mNfcAOperationFailure = "discovery_failed";
+                return;
+            }
+            mNfcATagEmulationController.restore();
+            if (!mNfcATagEmulationController.needsRecovery()) {
+                mNfcADiscoveryRecoveryRequired = false;
+                applyRouting(true);
+                if (isNfcEnabled() && computeDiscoveryParameters(mScreenState)
+                        .shouldEnableDiscovery() != mDeviceHost.isDiscoveryEnabled()) {
+                    mNfcADiscoveryRecoveryRequired = true;
+                    mNfcAOperationFailure = "discovery_failed";
+                    mDeviceHost.disableDiscovery();
+                }
+            }
+        } finally {
+            watchdog.cancel();
         }
     }
 
@@ -4140,6 +4180,16 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                 }
                 if (!isNfcEnabled()) {
                     return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_NFC_NOT_ENABLED;
+                }
+                if (setConfig && caller != Process.SYSTEM_UID) {
+                    if (!mForegroundUtils.isInForeground(caller)
+                            || (mNfcAForegroundUid != caller
+                            && !mForegroundUtils.registerUidToBackgroundCallback(
+                                    NfcService.this, caller))) {
+                        mNfcAOperationFailure = "background";
+                        return NfcOemExtension.EMULATE_NFC_A_TAG_STATUS_FAILED_INTERNAL;
+                    }
+                    mNfcAForegroundUid = caller;
                 }
                 WatchDogThread watchdog = new WatchDogThread("emulateNfcATag", ROUTING_WATCHDOG_MS);
                 watchdog.start();
