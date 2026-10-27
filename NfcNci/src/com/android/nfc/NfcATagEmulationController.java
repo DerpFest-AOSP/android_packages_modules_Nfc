@@ -21,17 +21,52 @@ final class NfcATagEmulationController {
         boolean set(int id, byte[] value, boolean custom);
     }
 
+    /**
+     * One published identity session. Lock-free readers must use a single instance so owner,
+     * generation, recovery, and the active parameters cannot be mixed across updates.
+     */
+    static final class Session {
+        final LinkedHashMap<Integer, byte[]> parameters;
+        final boolean recoveryRequired;
+        final long generation;
+        final int ownerUid;
+
+        Session(
+                LinkedHashMap<Integer, byte[]> parameters,
+                boolean recoveryRequired,
+                long generation,
+                int ownerUid) {
+            this.parameters = parameters;
+            this.recoveryRequired = recoveryRequired;
+            this.generation = generation;
+            this.ownerUid = ownerUid;
+        }
+
+        boolean isActive() {
+            return parameters != null && !recoveryRequired;
+        }
+    }
+
     private final Configuration mConfiguration;
     private final NfcATagRecoveryJournal mJournal;
     private boolean mJournalLoaded;
     private String mFailure;
     private int mFailedParameter = -1;
     private final LinkedHashMap<Integer, byte[]> mBaseline = new LinkedHashMap<>();
-    // Error callbacks must inspect these without waiting on an in-flight NFC transaction.
-    private volatile LinkedHashMap<Integer, byte[]> mActive;
-    private volatile boolean mRecoveryRequired;
-    private volatile long mGeneration;
-    private volatile int mOwnerUid = -1;
+    // Mutated only while the NFC service lock is held, then published together.
+    private LinkedHashMap<Integer, byte[]> mActive;
+    private boolean mRecoveryRequired;
+    private long mGeneration;
+    private int mOwnerUid = -1;
+    private volatile Session mPublished = new Session(null, false, 0, -1);
+
+    private void publish() {
+        mPublished = new Session(mActive, mRecoveryRequired, mGeneration, mOwnerUid);
+    }
+
+    Session session() {
+        return mPublished;
+    }
 
     NfcATagEmulationController(Configuration configuration, NfcATagRecoveryJournal journal) {
         mConfiguration = configuration;
@@ -44,10 +79,12 @@ final class NfcATagEmulationController {
             mBaseline.putAll(mJournal.load());
             mRecoveryRequired = !mBaseline.isEmpty();
             mJournalLoaded = true;
+            publish();
             return true;
         } catch (IOException e) {
             mRecoveryRequired = true;
             mFailure = "journal_unavailable";
+            publish();
             return false;
         }
     }
@@ -106,6 +143,7 @@ final class NfcATagEmulationController {
         mBaseline.putAll(baseline);
         // Also fail closed if the driver throws instead of returning a status.
         mRecoveryRequired = true;
+        publish();
         if (!write(target, true, true)) {
             String failure = mFailure;
             int parameter = mFailedParameter;
@@ -129,6 +167,7 @@ final class NfcATagEmulationController {
             mFailure = failure;
             mFailedParameter = parameter;
             mGeneration++;
+            publish();
             return FAILED;
         }
         mActive = copy(target);
@@ -137,6 +176,7 @@ final class NfcATagEmulationController {
         mFailedParameter = -1;
         mOwnerUid = ownerUid;
         mGeneration++;
+        publish();
         return OK;
     }
 
@@ -146,11 +186,13 @@ final class NfcATagEmulationController {
         if (!loadJournal()) return FAILED;
         if (mBaseline.isEmpty()) return mRecoveryRequired ? FAILED : OK;
         mRecoveryRequired = true;
+        publish();
         if (!write(mBaseline, false, false)) {
             mRecoveryRequired = true;
             mActive = null;
             mOwnerUid = -1;
             mGeneration++;
+            publish();
             return FAILED;
         }
         try {
@@ -161,6 +203,7 @@ final class NfcATagEmulationController {
             mActive = null;
             mOwnerUid = -1;
             mGeneration++;
+            publish();
             return FAILED;
         }
         clearRestoredSession();
@@ -182,6 +225,7 @@ final class NfcATagEmulationController {
                 mFailure = "snapshot_unavailable";
                 mFailedParameter = id;
                 mRecoveryRequired = true;
+                publish();
                 return false;
             }
             baseline.put(id, value.clone());
@@ -193,6 +237,7 @@ final class NfcATagEmulationController {
                 mFailure = "snapshot_unavailable";
                 mFailedParameter = id;
                 mRecoveryRequired = true;
+                publish();
                 return false;
             }
             baseline.put(id, value.clone());
@@ -207,6 +252,7 @@ final class NfcATagEmulationController {
         } catch (IOException e) {
             mFailure = "journal_unavailable";
             mRecoveryRequired = true;
+            publish();
             return false;
         }
         clearRestoredSession();
@@ -221,6 +267,7 @@ final class NfcATagEmulationController {
         mOwnerUid = -1;
         mRecoveryRequired = false;
         mGeneration++;
+        publish();
     }
 
     boolean isActive() {
@@ -295,6 +342,7 @@ final class NfcATagEmulationController {
                 mGeneration++;
                 mFailure = "recovery_required";
                 mFailedParameter = id;
+                publish();
                 throw e;
             }
             if (!matches) {

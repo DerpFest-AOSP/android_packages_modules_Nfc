@@ -504,8 +504,10 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
     private final NfcATagFeedback mNfcATagFeedback = new NfcATagFeedback();
     private int mNfcAForegroundUid = -1;
     private String mNfcAOperationFailure;
-    private volatile boolean mNfcAUserSwitchPending;
-    private volatile boolean mNfcADiscoveryRecoveryRequired;
+    private boolean mNfcAUserSwitchPending;
+    private boolean mNfcADiscoveryRecoveryRequired;
+    // Lock-free error feedback reads this instead of the fields above and mUserId.
+    private volatile NfcAErrorView mNfcAErrorView = new NfcAErrorView(0, false, false);
     // Routing was left unchanged by policy. Discovery may resume on a later attempt.
     private boolean mNfcARoutingDeferred;
     private GesturePollFrameObserver mGesturePollFrameObserver;
@@ -933,12 +935,43 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
     // The native layer may abort immediately after this callback. Do not queue feedback,
     // take the service lock or delay recovery while a controller response is outstanding.
     private void playNfcATagErrorFeedback() {
-        int owner = mNfcATagEmulationController.ownerUid();
-        boolean active = mNfcATagEmulationController.isActive()
-                && !mNfcAUserSwitchPending && !mNfcADiscoveryRecoveryRequired
-                && owner >= 0 && UserHandle.getUserHandleForUid(owner).getIdentifier() == mUserId;
-        vibrateNfcATagFeedback(mNfcATagFeedback.error(active,
-                mNfcATagEmulationController.generation(), SystemClock.elapsedRealtime()));
+        NfcATagEmulationController.Session session = mNfcATagEmulationController.session();
+        NfcAErrorView view = mNfcAErrorView;
+        boolean active = session.isActive()
+                && !view.userSwitchPending
+                && !view.discoveryRecoveryRequired
+                && session.ownerUid >= 0
+                && UserHandle.getUserHandleForUid(session.ownerUid).getIdentifier() == view.userId;
+        vibrateNfcATagFeedback(mNfcATagFeedback.error(
+                active, session.generation, SystemClock.elapsedRealtime()));
+    }
+
+    /** Service suppression and user id published together for lock-free error feedback. */
+    private static final class NfcAErrorView {
+        final int userId;
+        final boolean userSwitchPending;
+        final boolean discoveryRecoveryRequired;
+
+        NfcAErrorView(int userId, boolean userSwitchPending, boolean discoveryRecoveryRequired) {
+            this.userId = userId;
+            this.userSwitchPending = userSwitchPending;
+            this.discoveryRecoveryRequired = discoveryRecoveryRequired;
+        }
+    }
+
+    private void publishNfcAErrorView() {
+        mNfcAErrorView = new NfcAErrorView(
+                mUserId, mNfcAUserSwitchPending, mNfcADiscoveryRecoveryRequired);
+    }
+
+    private void setNfcADiscoveryRecoveryRequired(boolean required) {
+        mNfcADiscoveryRecoveryRequired = required;
+        publishNfcAErrorView();
+    }
+
+    private void setNfcAUserSwitchPending(boolean pending) {
+        mNfcAUserSwitchPending = pending;
+        publishNfcAErrorView();
     }
 
     private void handleNfcATagFieldFeedback(boolean fieldOn) {
@@ -1321,6 +1354,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
 
     public NfcService(Application nfcApplication, NfcInjector nfcInjector) {
         mUserId = ActivityManager.getCurrentUser();
+        publishNfcAErrorView();
         mContext = nfcApplication;
         mNfcInjector = nfcInjector;
         mLooper = mNfcInjector.getMainLooper();
@@ -2118,7 +2152,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                 mTagObjectMap.clear();
             }
             synchronized (NfcService.this) {
-                mNfcADiscoveryRecoveryRequired = false;
+                setNfcADiscoveryRecoveryRequired(false);
                 mNfcARoutingDeferred = false;
                 mNfcAOperationFailure = null;
                 if (mNfcATagEmulationController.isActive()
@@ -2139,14 +2173,14 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                             }
                         }
                         if (mNfcATagEmulationController.needsRecovery()) {
-                            mNfcADiscoveryRecoveryRequired = true;
+                            setNfcADiscoveryRecoveryRequired(true);
                             if (mNfcAOperationFailure == null) {
                                 mNfcAOperationFailure =
                                         mNfcATagEmulationController.failureReason();
                             }
                         }
                     } else {
-                        mNfcADiscoveryRecoveryRequired = true;
+                        setNfcADiscoveryRecoveryRequired(true);
                         mNfcAOperationFailure = "discovery_failed";
                     }
                 }
@@ -2237,7 +2271,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                     if (!mDeviceHost.isDiscoveryEnabled()) {
                         mNfcATagEmulationController.restore();
                     } else {
-                        mNfcADiscoveryRecoveryRequired = true;
+                        setNfcADiscoveryRecoveryRequired(true);
                         mNfcAOperationFailure = "discovery_failed";
                     }
                 }
@@ -2578,13 +2612,13 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
             mNfcAOperationFailure = null;
             mDeviceHost.disableDiscovery();
             if (mDeviceHost.isDiscoveryEnabled()) {
-                mNfcADiscoveryRecoveryRequired = true;
+                setNfcADiscoveryRecoveryRequired(true);
                 mNfcAOperationFailure = "discovery_failed";
                 return;
             }
             mNfcATagEmulationController.restore();
             if (!mNfcATagEmulationController.needsRecovery()) {
-                mNfcADiscoveryRecoveryRequired = false;
+                setNfcADiscoveryRecoveryRequired(false);
                 acceptNfcARoutingResult(applyRouting(true));
             }
         } finally {
@@ -4236,7 +4270,7 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                             bitFrameSdd, platformConfig, selInfo, nfcid1, rats, histBytes)
                             : mNfcATagEmulationController.restore();
                     if (!mNfcATagEmulationController.needsRecovery()) {
-                        mNfcADiscoveryRecoveryRequired = false;
+                        setNfcADiscoveryRecoveryRequired(false);
                         int routing = applyRouting(true);
                         if (routing != ROUTING_APPLIED && routing != ROUTING_DEFERRED) {
                             // A failed RF restart must not keep advertising the new identity.
@@ -5370,8 +5404,8 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
         if (mDeviceHost.isDiscoveryEnabled()) {
             mDeviceHost.disableDiscovery();
         }
-        mNfcADiscoveryRecoveryRequired = mNfcATagEmulationController.needsRecovery()
-                || mDeviceHost.isDiscoveryEnabled();
+        setNfcADiscoveryRecoveryRequired(mNfcATagEmulationController.needsRecovery()
+                || mDeviceHost.isDiscoveryEnabled());
     }
 
     private NfcDiscoveryParameters computeDiscoveryParameters(int screenState) {
@@ -6970,8 +7004,8 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                 synchronized (NfcService.this) {
                     mUserId = userId;
                     mNfcADiagnosticTrace.clear();
-                    mNfcAUserSwitchPending = mNfcATagEmulationController.isActive()
-                            || mNfcATagEmulationController.needsRecovery();
+                    setNfcAUserSwitchPending(mNfcATagEmulationController.isActive()
+                            || mNfcATagEmulationController.needsRecovery());
                 }
                 AsyncTask.THREAD_POOL_EXECUTOR.execute(() -> {
                     synchronized (NfcService.this) {
@@ -6986,11 +7020,11 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
                                 if (!mDeviceHost.isDiscoveryEnabled()) {
                                     mNfcATagEmulationController.restore();
                                 } else {
-                                    mNfcADiscoveryRecoveryRequired = true;
+                                    setNfcADiscoveryRecoveryRequired(true);
                                     mNfcAOperationFailure = "discovery_failed";
                                 }
                             }
-                            mNfcAUserSwitchPending = false;
+                            setNfcAUserSwitchPending(false);
                             acceptNfcARoutingResult(applyRouting(true));
                         } finally {
                             watchdog.cancel();

@@ -113,6 +113,27 @@ public class NfcATagEmulationControllerTest {
     }
 
     @Test
+    public void publishedSessionKeepsOwnerGenerationAndRecoveryTogether() {
+        hardware.beforeWrite =
+                () -> {
+                    NfcATagEmulationController.Session session = controller.session();
+                    assertEquals(
+                            session.parameters != null && !session.recoveryRequired,
+                            session.isActive());
+                    assertFalse(session.isActive());
+                    assertTrue(session.recoveryRequired);
+                };
+        assertEquals(0, apply(uid));
+        NfcATagEmulationController.Session done = controller.session();
+        assertTrue(done.isActive());
+        assertEquals(10042, done.ownerUid);
+        assertFalse(done.recoveryRequired);
+        assertNotNull(done.parameters);
+        assertEquals(done.generation, controller.generation());
+        assertEquals(done.ownerUid, controller.ownerUid());
+    }
+
+    @Test
     public void activeArraysAreDefensivelyCopied() {
         assertEquals(0, apply(uid));
         uid[0] = 99;
