@@ -15,7 +15,25 @@
 //
 
 #include <gtest/gtest.h>
+
+#include <vector>
+
+#include "nfa_dm_int.h"
+
+static bool sCaptureSetConfig;
+static std::vector<uint8_t> sCapturedSetConfig;
+
+static tNFC_STATUS NfaDmTestSetConfig(uint8_t tlv_size, uint8_t* p_tlv_list) {
+  if (sCaptureSetConfig) {
+    sCapturedSetConfig.assign(p_tlv_list, p_tlv_list + tlv_size);
+    return NFC_STATUS_OK;
+  }
+  return NFC_SetConfig(tlv_size, p_tlv_list);
+}
+
+#define NFC_SetConfig NfaDmTestSetConfig
 #include "nfa_dm_main.cc"
+#undef NFC_SetConfig
 
 // tests for nfa_dm_is_protocol_supported
 
@@ -118,6 +136,28 @@ TEST(NfaDmMainTest, NoUpdateNeeded) {
     ASSERT_EQ(nfa_dm_cb.params.pf_rc[0], 0x01);
 }
 
+TEST(NfaDmMainTest, AppInitiatedUnchangedConfigSendsCompleteTlv) {
+    const uint8_t previousPending = nfa_dm_cb.setcfg_pending_num;
+    nfa_dm_cb.setcfg_pending_num = 0;
+    nfa_dm_cb.params.la_bit_frame_sdd_len = 1;
+    nfa_dm_cb.params.la_bit_frame_sdd[0] = 0x04;
+    uint8_t tlv_list[] = {NFC_PMID_LA_BIT_FRAME_SDD, 1, 0x04};
+
+    sCapturedSetConfig.clear();
+    sCaptureSetConfig = true;
+    const tNFA_STATUS result = nfa_dm_check_set_config(sizeof(tlv_list), tlv_list, true);
+    const uint8_t pendingAfter = nfa_dm_cb.setcfg_pending_num;
+    nfa_dm_cb.setcfg_pending_num = previousPending;
+    sCaptureSetConfig = false;
+
+    EXPECT_EQ(result, NFA_STATUS_OK);
+    ASSERT_EQ(sCapturedSetConfig.size(), sizeof(tlv_list));
+    EXPECT_EQ(sCapturedSetConfig[0], NFC_PMID_LA_BIT_FRAME_SDD);
+    EXPECT_EQ(sCapturedSetConfig[1], 1);
+    EXPECT_EQ(sCapturedSetConfig[2], 0x04);
+    EXPECT_EQ(pendingAfter, 1);
+}
+
 TEST(NfaDmMainTest, InvalidType) {
     uint8_t tlv_list[] = {0xFF, 1, 0x01};
     EXPECT_EQ(nfa_dm_check_set_config(sizeof(tlv_list), tlv_list, false), 0x03);
@@ -145,4 +185,3 @@ TEST(NfaDmMainTest, ExcessiveTLVLength) {
     tlv_list[1] = 254;
     EXPECT_EQ(nfa_dm_check_set_config(sizeof(tlv_list), tlv_list, false), NFA_STATUS_FAILED);
 }
-
