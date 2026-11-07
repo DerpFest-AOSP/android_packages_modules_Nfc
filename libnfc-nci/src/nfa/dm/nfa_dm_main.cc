@@ -385,9 +385,9 @@ tNFA_STATUS nfa_dm_check_set_config(uint8_t tlv_list_len, uint8_t* p_tlv_list,
       }
     }
 
-    if (update) {
-      /* we don't store this type */
-      if (p_stored) {
+    if (update || app_init) {
+      /* we don't store this type unless its value changed */
+      if (update && p_stored) {
         memcpy(p_stored, p_value, len);
       }
 
